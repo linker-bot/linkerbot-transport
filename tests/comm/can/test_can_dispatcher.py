@@ -1,4 +1,5 @@
 import math
+import queue
 import threading
 import time
 from typing import Any
@@ -15,6 +16,7 @@ class FakeBus:
         self.sent: list[can.Message] = []
         self.send_timeouts: list[float | None] = []
         self.send_event = threading.Event()
+        self.shutdown_event = threading.Event()
         self.shutdown_calls = 0
         self.receive_error: Exception | None = None
 
@@ -33,6 +35,23 @@ class FakeBus:
 
     def shutdown(self) -> None:
         self.shutdown_calls += 1
+        self.shutdown_event.set()
+
+
+class BlockingPutQueue:
+    def __init__(self) -> None:
+        self.put_entered = threading.Event()
+        self.release_put = threading.Event()
+        self.items: list[can.Message] = []
+
+    def get(self, timeout: float | None = None) -> can.Message:
+        time.sleep(min(timeout or 0.001, 0.001))
+        raise queue.Empty
+
+    def put_nowait(self, message: can.Message) -> None:
+        self.put_entered.set()
+        self.release_put.wait()
+        self.items.append(message)
 
 
 def make_dispatcher(
@@ -237,3 +256,235 @@ def test_stop_reports_worker_that_ignores_bus_shutdown(
         dispatcher._send_thread.join(timeout=1.0)
 
     assert not dispatcher._send_thread.is_alive()
+
+
+def test_send_and_stop_are_atomic_at_queue_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bus = FakeBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+    blocking_queue = BlockingPutQueue()
+    dispatcher._send_queue = blocking_queue  # ty: ignore[invalid-assignment]
+    send_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+    stop_returned = threading.Event()
+
+    def send() -> None:
+        try:
+            dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
+        except Exception as error:
+            send_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+        finally:
+            stop_returned.set()
+
+    sender = threading.Thread(target=send)
+    stopper = threading.Thread(target=stop)
+    sender.start()
+    assert blocking_queue.put_entered.wait(timeout=1.0)
+    stopper.start()
+    assert not stop_returned.wait(timeout=0.03)
+
+    blocking_queue.release_put.set()
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert send_errors == []
+    assert stop_errors == []
+    assert len(blocking_queue.items) == 1
+    assert bus.shutdown_calls == 1
+
+
+def test_send_now_waiting_for_transmit_lock_cannot_send_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    bus = FakeBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+    message = can.Message(arbitration_id=1, data=b"x")
+    sender_started = threading.Event()
+    sender_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+
+    dispatcher._transmit_lock.acquire()
+
+    def send_now() -> None:
+        sender_started.set()
+        try:
+            dispatcher.send_now(message)
+        except Exception as error:
+            sender_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+
+    sender = threading.Thread(target=send_now)
+    stopper = threading.Thread(target=stop)
+    try:
+        sender.start()
+        assert sender_started.wait(timeout=1.0)
+        stopper.start()
+        assert bus.shutdown_event.wait(timeout=1.0)
+    finally:
+        dispatcher._transmit_lock.release()
+
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert len(sender_errors) == 1
+    assert isinstance(sender_errors[0], RuntimeError)
+    assert stop_errors == []
+    assert bus.sent == []
+
+
+def test_stop_waits_for_in_flight_send_now_before_bus_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.2)
+
+    class OrderedSendBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+            self.send_finished = threading.Event()
+            self.shutdown_before_send_finished = False
+
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            self.send_started.set()
+            self.release_send.wait(timeout=1.0)
+            super().send(message, timeout)
+            self.send_finished.set()
+
+        def shutdown(self) -> None:
+            self.shutdown_before_send_finished = not self.send_finished.is_set()
+            super().shutdown()
+
+    bus = OrderedSendBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+    message = can.Message(arbitration_id=1, data=b"x")
+    send_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+
+    def send_now() -> None:
+        try:
+            dispatcher.send_now(message)
+        except Exception as error:
+            send_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+
+    sender = threading.Thread(target=send_now)
+    stopper = threading.Thread(target=stop)
+    sender.start()
+    assert bus.send_started.wait(timeout=1.0)
+    stopper.start()
+
+    try:
+        assert not bus.shutdown_event.wait(timeout=0.03)
+    finally:
+        bus.release_send.set()
+
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert send_errors == []
+    assert stop_errors == []
+    assert bus.shutdown_calls == 1
+    assert not bus.shutdown_before_send_finished
+
+
+def test_stop_from_callback_prevents_later_copied_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IncomingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.incoming: queue.Queue[can.Message] = queue.Queue()
+
+        def recv(self, timeout: float) -> can.Message | None:
+            try:
+                return self.incoming.get(timeout=timeout)
+            except queue.Empty:
+                return None
+
+    bus = IncomingBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+    first_returned = threading.Event()
+    second_called = threading.Event()
+
+    def stop_from_callback(message: can.Message) -> None:
+        _ = message
+        dispatcher.stop()
+        first_returned.set()
+
+    dispatcher.subscribe(stop_from_callback)
+    dispatcher.subscribe(lambda message: second_called.set())
+    bus.incoming.put(can.Message(arbitration_id=1, data=b"x"))
+
+    assert first_returned.wait(timeout=1.0)
+    dispatcher._recv_thread.join(timeout=1.0)
+    assert not dispatcher._recv_thread.is_alive()
+    assert not second_called.is_set()
+
+
+def test_send_now_preserves_existing_sdk_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = ValidationError("invalid CAN frame")
+
+    class InvalidSendBus(FakeBus):
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            _ = message, timeout
+            raise expected
+
+    dispatcher = make_dispatcher(monkeypatch, InvalidSendBus())
+    try:
+        with pytest.raises(ValidationError) as raised:
+            dispatcher.send_now(can.Message(arbitration_id=1, data=b"x"))
+        assert raised.value is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_shutdown_failure_is_preserved_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = ValidationError("shutdown failed")
+
+    class FlakyShutdownBus(FakeBus):
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if self.shutdown_calls == 1:
+                raise expected
+            self.shutdown_event.set()
+
+    bus = FlakyShutdownBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+
+    with pytest.raises(ValidationError) as raised:
+        dispatcher.stop()
+    assert raised.value is expected
+    assert dispatcher._shutdown_complete is False
+
+    dispatcher.stop()
+    assert dispatcher._shutdown_complete is True
+    assert bus.shutdown_calls == 2

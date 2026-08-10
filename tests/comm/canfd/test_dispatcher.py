@@ -6,6 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
+from linkerbot.comm.canfd import dispatcher as dispatcher_module
 from linkerbot.exceptions import CANError, ValidationError
 
 
@@ -14,6 +15,7 @@ class FakeInterface:
         self.incoming: queue.Queue[CANFDMessage | Exception] = queue.Queue()
         self.sent: list[CANFDMessage] = []
         self.closed = False
+        self.close_event = threading.Event()
         self.close_calls = 0
         self.send_error: Exception | None = None
         self.receive_error: Exception | None = None
@@ -38,6 +40,26 @@ class FakeInterface:
     def close(self) -> None:
         self.close_calls += 1
         self.closed = True
+        self.close_event.set()
+
+
+class BlockingPutQueue:
+    def __init__(self) -> None:
+        self.put_entered = threading.Event()
+        self.release_put = threading.Event()
+        self.items: list[CANFDMessage] = []
+
+    def get(self, timeout: float | None = None) -> CANFDMessage:
+        time.sleep(min(timeout or 0.001, 0.001))
+        raise queue.Empty
+
+    def get_nowait(self) -> CANFDMessage:
+        raise queue.Empty
+
+    def put_nowait(self, message: CANFDMessage) -> None:
+        self.put_entered.set()
+        self.release_put.wait()
+        self.items.append(message)
 
 
 def wait_until(predicate: Callable[[], bool], timeout_s: float = 1.0) -> None:
@@ -355,3 +377,248 @@ def test_error_backoff_recovers_within_milliseconds() -> None:
         wait_until(lambda: received == [message], timeout_s=0.2)
     finally:
         dispatcher.stop()
+
+
+def test_send_and_stop_are_atomic_at_queue_boundary() -> None:
+    interface = FakeInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    blocking_queue = BlockingPutQueue()
+    dispatcher._send_queue = blocking_queue  # ty: ignore[invalid-assignment]
+    send_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+    stop_returned = threading.Event()
+    message = CANFDMessage(arbitration_id=1, data=b"x")
+
+    def send() -> None:
+        try:
+            dispatcher.send(message)
+        except Exception as error:
+            send_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+        finally:
+            stop_returned.set()
+
+    sender = threading.Thread(target=send)
+    stopper = threading.Thread(target=stop)
+    sender.start()
+    assert blocking_queue.put_entered.wait(timeout=1.0)
+    stopper.start()
+    assert not stop_returned.wait(timeout=0.03)
+
+    blocking_queue.release_put.set()
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert send_errors == []
+    assert stop_errors == []
+    assert blocking_queue.items == [message]
+    assert interface.close_calls == 1
+
+
+def test_send_now_waiting_for_transmit_lock_cannot_send_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dispatcher_module, "THREAD_JOIN_TIMEOUT_S", 0.01)
+    interface = FakeInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    message = CANFDMessage(arbitration_id=1, data=b"x")
+    sender_started = threading.Event()
+    sender_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+
+    dispatcher._transmit_lock.acquire()
+
+    def send_now() -> None:
+        sender_started.set()
+        try:
+            dispatcher.send_now(message)
+        except Exception as error:
+            sender_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+
+    sender = threading.Thread(target=send_now)
+    stopper = threading.Thread(target=stop)
+    try:
+        sender.start()
+        assert sender_started.wait(timeout=1.0)
+        stopper.start()
+        assert interface.close_event.wait(timeout=1.0)
+    finally:
+        dispatcher._transmit_lock.release()
+
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert len(sender_errors) == 1
+    assert isinstance(sender_errors[0], RuntimeError)
+    assert stop_errors == []
+    assert interface.sent == []
+
+
+def test_stop_waits_for_in_flight_send_now_before_interface_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dispatcher_module, "THREAD_JOIN_TIMEOUT_S", 0.2)
+
+    class OrderedSendInterface(FakeInterface):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+            self.send_finished = threading.Event()
+            self.close_before_send_finished = False
+
+        def send(self, message: CANFDMessage, timeout_ms: int = 10) -> None:
+            self.send_started.set()
+            self.release_send.wait(timeout=1.0)
+            super().send(message, timeout_ms)
+            self.send_finished.set()
+
+        def close(self) -> None:
+            self.close_before_send_finished = not self.send_finished.is_set()
+            super().close()
+
+    interface = OrderedSendInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    message = CANFDMessage(arbitration_id=1, data=b"x")
+    send_errors: list[Exception] = []
+    stop_errors: list[Exception] = []
+
+    def send_now() -> None:
+        try:
+            dispatcher.send_now(message)
+        except Exception as error:
+            send_errors.append(error)
+
+    def stop() -> None:
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            stop_errors.append(error)
+
+    sender = threading.Thread(target=send_now)
+    stopper = threading.Thread(target=stop)
+    sender.start()
+    assert interface.send_started.wait(timeout=1.0)
+    stopper.start()
+
+    try:
+        assert not interface.close_event.wait(timeout=0.03)
+    finally:
+        interface.release_send.set()
+
+    sender.join(timeout=1.0)
+    stopper.join(timeout=1.0)
+
+    assert not sender.is_alive()
+    assert not stopper.is_alive()
+    assert send_errors == []
+    assert stop_errors == []
+    assert interface.close_calls == 1
+    assert not interface.close_before_send_finished
+
+
+def test_stop_from_callback_prevents_later_copied_callback() -> None:
+    interface = FakeInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    first_returned = threading.Event()
+    second_called = threading.Event()
+
+    def stop_from_callback(message: CANFDMessage) -> None:
+        _ = message
+        dispatcher.stop()
+        first_returned.set()
+
+    dispatcher.subscribe(stop_from_callback)
+    dispatcher.subscribe(lambda message: second_called.set())
+    interface.incoming.put(CANFDMessage(arbitration_id=1, data=b"x"))
+
+    assert first_returned.wait(timeout=1.0)
+    dispatcher._recv_thread.join(timeout=1.0)
+    assert not dispatcher._recv_thread.is_alive()
+    assert not second_called.is_set()
+
+
+def test_stop_closes_interface_after_worker_join_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CloseInterruptsReceiveInterface(FakeInterface):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receive_entered = threading.Event()
+            self.release_receive = threading.Event()
+
+        def receive(
+            self, max_frames: int = 64, timeout_ms: int = 10
+        ) -> list[CANFDMessage]:
+            _ = max_frames, timeout_ms
+            self.receive_entered.set()
+            self.release_receive.wait(timeout=1.0)
+            return []
+
+        def close(self) -> None:
+            super().close()
+            self.release_receive.set()
+
+    monkeypatch.setattr(dispatcher_module, "THREAD_JOIN_TIMEOUT_S", 0.01)
+    interface = CloseInterruptsReceiveInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    assert interface.receive_entered.wait(timeout=1.0)
+
+    dispatcher.stop()
+
+    assert interface.close_calls == 1
+    assert interface.closed is True
+    assert not dispatcher._recv_thread.is_alive()
+    assert not dispatcher._send_thread.is_alive()
+
+
+def test_send_now_preserves_existing_sdk_error() -> None:
+    interface = FakeInterface()
+    expected = ValidationError("invalid CANFD frame")
+    interface.send_error = expected
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    try:
+        with pytest.raises(ValidationError) as raised:
+            dispatcher.send_now(CANFDMessage(arbitration_id=1, data=b"x"))
+        assert raised.value is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_interface_close_failure_is_preserved_and_retryable() -> None:
+    expected = ValidationError("close failed")
+
+    class FlakyCloseInterface(FakeInterface):
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise expected
+            self.closed = True
+            self.close_event.set()
+
+    interface = FlakyCloseInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+
+    with pytest.raises(ValidationError) as raised:
+        dispatcher.stop()
+    assert raised.value is expected
+    assert dispatcher._interface_closed is False
+
+    dispatcher.stop()
+    assert dispatcher._interface_closed is True
+    assert interface.close_calls == 2

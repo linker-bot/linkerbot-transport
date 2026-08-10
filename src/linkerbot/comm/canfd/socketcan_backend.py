@@ -30,7 +30,7 @@ import threading
 
 import can
 
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot.exceptions import CANError, HandSDKError, ValidationError
 
 from .types import (
     CANFD_DEFAULT_DATA_BAUD,
@@ -269,6 +269,10 @@ class SocketCANFDBackend:
 
         This does not run ``ip link set ... down`` — the link is shared state
         and may be in use by other processes.
+
+        Raises:
+            CANError: If python-can cannot shut down the bus. The backend remains
+                retryable after a failed shutdown.
         """
         with self._lock:
             if self._closed:
@@ -276,8 +280,14 @@ class SocketCANFDBackend:
             self._closed = True
             try:
                 self._bus.shutdown()
-            except Exception:
-                pass
+            except HandSDKError:
+                self._closed = False
+                raise
+            except Exception as error:
+                self._closed = False
+                raise CANError(
+                    f"SocketCAN FD shutdown failed: {error}", cause=error
+                ) from error
 
     def _ensure_link_state(self, *, auto_reconfigure: bool) -> None:
         state = _read_link_state(self._channel)

@@ -164,7 +164,7 @@ def test_libcanbus_init_nonzero_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(lib.LibCANbus_Exit.calls) == 0
 
 
-def test_close_failure_still_releases_refcount(
+def test_close_failure_retains_refcount_until_retry_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lib = _FakeLib()
@@ -175,13 +175,19 @@ def test_close_failure_still_releases_refcount(
     with pytest.raises(CANError, match="CAN_CloseDevice"):
         interface.close()
 
-    # Even on CloseDevice failure, refcount should drop so Exit runs and a
-    # later re-open can re-init cleanly.
+    key = backend._library_key(lib)
+    assert len(lib.LibCANbus_Exit.calls) == 0
+    assert backend._lifecycle_snapshot() == {key: 1}
+
+    lib.CAN_CloseDevice.result = 0
+    interface.close()
+
+    assert lib.CAN_CloseDevice.calls == [(0, 0), (0, 0)]
     assert len(lib.LibCANbus_Exit.calls) == 1
     assert backend._lifecycle_snapshot() == {}
 
 
-def test_close_exception_still_releases_refcount(
+def test_close_exception_retains_refcount_until_retry_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lib = _FakeLib()
@@ -196,6 +202,14 @@ def test_close_exception_still_releases_refcount(
     with pytest.raises(CANError, match="vendor close crashed"):
         interface.close()
 
+    key = backend._library_key(lib)
+    assert len(lib.LibCANbus_Exit.calls) == 0
+    assert backend._lifecycle_snapshot() == {key: 1}
+
+    lib.CAN_CloseDevice.hook = None
+    interface.close()
+
+    assert lib.CAN_CloseDevice.calls == [(0, 0), (0, 0)]
     assert len(lib.LibCANbus_Exit.calls) == 1
     assert backend._lifecycle_snapshot() == {}
 

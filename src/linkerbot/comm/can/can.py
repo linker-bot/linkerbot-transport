@@ -2,11 +2,12 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import can
 
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot.exceptions import CANError, HandSDKError, ValidationError
 
 from .types import CanInterface
 
@@ -14,6 +15,20 @@ DEFAULT_MAX_CONSECUTIVE_ERRORS = 10
 ERROR_BACKOFF_BASE_S = 0.005
 ERROR_BACKOFF_MAX_S = 0.05
 THREAD_JOIN_TIMEOUT_S = 1.0
+
+
+class _ImmediateDispatchState:
+    __slots__ = ("claim_dispatch", "claim_result", "mark_dispatched", "marked")
+
+    def __init__(
+        self,
+        claim_dispatch: Callable[[], bool],
+        mark_dispatched: Callable[[], None],
+    ) -> None:
+        self.claim_dispatch = claim_dispatch
+        self.claim_result: bool | None = None
+        self.mark_dispatched = mark_dispatched
+        self.marked = False
 
 
 class CANMessageDispatcher:
@@ -71,6 +86,8 @@ class CANMessageDispatcher:
         self._error_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
+        self._transmit_lock = threading.Lock()
+        self._immediate_dispatch = threading.local()
         self._recv_thread: threading.Thread = threading.Thread(
             target=self._recv_loop, daemon=True, name="CANMessageDispatcher.recv_loop"
         )
@@ -108,20 +125,26 @@ class CANMessageDispatcher:
         callback execution.
         """
         consecutive_errors = 0
-        while self._running:
+        while self._is_running():
             try:
                 msg = self._bus.recv(timeout=0.01)
                 consecutive_errors = 0
                 if not msg:
                     continue
+                if not self._is_running():
+                    return
                 with self._subscribers_lock:
                     subscribers_copy = self._subscribers[:]
                 for callback in subscribers_copy:
+                    if not self._is_running():
+                        return
                     try:
                         callback(msg)
                     except Exception as error:
                         self._logger.error("Error in callback: %s", error)
             except Exception as error:
+                if not self._is_running():
+                    return
                 consecutive_errors += 1
                 self._logger.warning(
                     "CAN receive error (%d/%d): %s",
@@ -162,19 +185,25 @@ class CANMessageDispatcher:
         interval of 300 us to avoid flooding the CAN bus.
         """
         consecutive_errors = 0
-        while self._running:
+        while self._is_running():
             try:
                 msg = self._send_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
             try:
                 deadline = time.monotonic() + self.SEND_INTERVAL_S
-                self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
+                with self._transmit_lock:
+                    with self._error_lock:
+                        if not self._running:
+                            return
+                    self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
                 consecutive_errors = 0
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
             except Exception as error:
+                if not self._is_running():
+                    return
                 consecutive_errors += 1
                 self._logger.warning(
                     "CAN send error (%d/%d): %s",
@@ -197,25 +226,80 @@ class CANMessageDispatcher:
             RuntimeError: If the dispatcher has been stopped.
             queue.Full: If the send queue is full (2000 messages).
         """
-        if self._bus_error is not None:
-            raise CANError(f"CAN bus unavailable: {self._bus_error}")
-        if not self._running:
-            raise RuntimeError("Cannot send on a stopped CANMessageDispatcher")
-        self._send_queue.put_nowait(msg)
+        state: _ImmediateDispatchState | None = getattr(
+            self._immediate_dispatch, "state", None
+        )
+        if state is not None:
+            if state.claim_result is None:
+                state.claim_result = state.claim_dispatch()
+            if not state.claim_result:
+                return
+            self.send_now(msg)
+            if not state.marked:
+                state.mark_dispatched()
+                state.marked = True
+            return
+        with self._error_lock:
+            self._raise_if_cannot_send_locked()
+            self._send_queue.put_nowait(msg)
+
+    def send_now(self, msg: can.Message) -> None:
+        """Send one frame synchronously and return only after backend success.
+
+        The unified hand scheduler uses this path so its ``DISPATCHED`` stage
+        reflects an actual transport call rather than insertion into the legacy
+        asynchronous queue. Existing callers keep the queued ``send`` behavior.
+        """
+        with self._transmit_lock:
+            with self._error_lock:
+                self._raise_if_cannot_send_locked()
+            try:
+                self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
+            except HandSDKError:
+                raise
+            except Exception as error:
+                raise CANError(f"CAN send failed: {error}", cause=error) from error
+
+    @contextmanager
+    def immediate_dispatch(
+        self,
+        claim_dispatch: Callable[[], bool],
+        mark_dispatched: Callable[[], None],
+    ) -> Iterator[None]:
+        """Make sends synchronous for the current thread and command scope."""
+        if not callable(claim_dispatch):
+            raise ValidationError("claim_dispatch must be callable")
+        if not callable(mark_dispatched):
+            raise ValidationError("mark_dispatched must be callable")
+        previous = getattr(self._immediate_dispatch, "state", None)
+        self._immediate_dispatch.state = _ImmediateDispatchState(
+            claim_dispatch, mark_dispatched
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._immediate_dispatch.state
+            else:
+                self._immediate_dispatch.state = previous
 
     def stop(self) -> None:
         """Stop the dispatcher and clean up resources.
 
         Stops the receive and send loops, waits for background threads to finish,
-        and shuts down the CAN bus interface. If a backend ignores the bounded
-        send timeout, shutting down the bus is used to interrupt its pending I/O.
+        and then boundedly drains synchronous transmit activity. When transmit is
+        idle, shutdown runs while holding the transmit lock. If a backend ignores
+        the bounded send timeout, bus shutdown is used to interrupt its pending I/O.
 
         Raises:
             RuntimeError: If a worker remains alive after the bus is shut down.
+            HandSDKError: If the backend reports a classified shutdown failure.
         """
         with self._error_lock:
             self._error_reported = True
-        self._running = False
+            self._running = False
+        with self._subscribers_lock:
+            self._subscribers.clear()
         current = threading.current_thread()
 
         running_threads = self._join_worker_threads(current)
@@ -225,22 +309,61 @@ class CANMessageDispatcher:
                 ", ".join(thread.name for thread in running_threads),
             )
 
-        with self._shutdown_lock:
-            if not self._shutdown_complete:
-                try:
-                    self._bus.shutdown()
-                except Exception as error:
-                    self._logger.warning("CAN bus shutdown failed: %s", error)
-                self._shutdown_complete = True
+        shutdown_error = self._shutdown_bus_after_transmit_drain()
 
         running_threads = self._join_worker_threads(current)
-        with self._subscribers_lock:
-            self._subscribers.clear()
+        transmit_idle = self._wait_for_transmit_idle()
         if running_threads:
             names = ", ".join(thread.name for thread in running_threads)
             raise RuntimeError(
                 f"CAN worker threads did not stop after bus shutdown: {names}"
             )
+        if not transmit_idle:
+            raise RuntimeError("CAN transmit did not stop after bus shutdown")
+        if shutdown_error is not None:
+            raise shutdown_error
+
+    def _is_running(self) -> bool:
+        with self._error_lock:
+            return self._running
+
+    def _raise_if_cannot_send_locked(self) -> None:
+        if self._bus_error is not None:
+            raise CANError(f"CAN bus unavailable: {self._bus_error}")
+        if not self._running:
+            raise RuntimeError("Cannot send on a stopped CANMessageDispatcher")
+
+    def _shutdown_bus(self) -> HandSDKError | None:
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return None
+            try:
+                self._bus.shutdown()
+            except HandSDKError as error:
+                return error
+            except Exception as error:
+                return CANError(f"CAN bus shutdown failed: {error}", cause=error)
+            self._shutdown_complete = True
+            return None
+
+    def _shutdown_bus_after_transmit_drain(self) -> HandSDKError | None:
+        transmit_idle = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
+        if not transmit_idle:
+            self._logger.warning(
+                "CAN transmit did not stop before bus shutdown; "
+                "shutting down the bus to interrupt it"
+            )
+            return self._shutdown_bus()
+        try:
+            return self._shutdown_bus()
+        finally:
+            self._transmit_lock.release()
+
+    def _wait_for_transmit_idle(self) -> bool:
+        acquired = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
+        if acquired:
+            self._transmit_lock.release()
+        return acquired
 
     def _join_worker_threads(self, current: threading.Thread) -> list[threading.Thread]:
         running_threads: list[threading.Thread] = []

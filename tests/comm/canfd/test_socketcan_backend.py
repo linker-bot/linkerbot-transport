@@ -477,6 +477,22 @@ def test_close_is_idempotent_and_blocks_further_io(
         backend.receive()
 
 
+def test_close_failure_is_preserved_and_retryable(
+    fake_can_bus, with_ip_present, link_show
+) -> None:
+    link_show.show_response = _link_show_proc(returncode=0, stdout=_link_show_payload())
+    expected = ValidationError("shutdown failed")
+    fake_can_bus.shutdown.side_effect = [expected, None]
+    backend = SocketCANFDBackend(channel="can0")
+
+    with pytest.raises(ValidationError) as raised:
+        backend.close()
+    assert raised.value is expected
+
+    backend.close()
+    assert fake_can_bus.shutdown.call_count == 2
+
+
 def test_missing_ip_command_raises(fake_can_bus) -> None:
     with mock.patch(
         "linkerbot.comm.canfd.socketcan_backend.shutil.which", return_value=None

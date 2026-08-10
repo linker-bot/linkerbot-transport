@@ -457,21 +457,27 @@ def test_concurrent_close_waits_for_io_device_close_and_lifecycle_release(
     assert len(lib.LibCANbus_Exit.calls) == 2
 
 
-def test_concurrent_close_waiter_is_notified_when_vendor_close_raises(
+def test_concurrent_close_waiter_retries_when_vendor_close_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lib = FakeLibrary()
     vendor_close_entered = threading.Event()
     allow_vendor_close = threading.Event()
 
-    def failing_vendor_close(*args: Any) -> int:
+    close_attempts = 0
+
+    def failing_once_vendor_close(*args: Any) -> int:
+        nonlocal close_attempts
         _ = args
+        close_attempts += 1
+        if close_attempts > 1:
+            return 0
         vendor_close_entered.set()
         if not allow_vendor_close.wait(timeout=2.0):
             raise TimeoutError("test did not release CAN_CloseDevice")
         raise OSError("vendor close crashed")
 
-    lib.CAN_CloseDevice.hook = failing_vendor_close
+    lib.CAN_CloseDevice.hook = failing_once_vendor_close
     interface = make_interface(monkeypatch, lib)
     first_errors: list[Exception] = []
     second_errors: list[Exception] = []
@@ -512,8 +518,9 @@ def test_concurrent_close_waiter_is_notified_when_vendor_close_raises(
     assert isinstance(first_errors[0], CANError)
     assert "vendor close crashed" in str(first_errors[0])
     assert second_errors == []
-    assert lib.CAN_CloseDevice.calls == [(0, 0)]
+    assert lib.CAN_CloseDevice.calls == [(0, 0), (0, 0)]
     assert len(lib.LibCANbus_Exit.calls) == 1
+    assert interface._close_succeeded
     assert interface._close_complete_event.is_set()
 
 
@@ -524,6 +531,13 @@ def test_close_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(CANError, match="CAN_CloseDevice"):
         interface.close()
+
+    assert not interface._close_succeeded
+    lib.CAN_CloseDevice.result = 0
+    interface.close()
+
+    assert interface._close_succeeded
+    assert lib.CAN_CloseDevice.calls == [(0, 0), (0, 0)]
 
 
 def test_default_config_maps_to_vendor_struct(monkeypatch: pytest.MonkeyPatch) -> None:
