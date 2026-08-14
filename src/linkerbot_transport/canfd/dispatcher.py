@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from linkerbot.exceptions import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
 
 from .ctypes_backend import CANFDInterface
 from .types import CANFDBackend, CANFDConfigOptions, CANFDMessage
