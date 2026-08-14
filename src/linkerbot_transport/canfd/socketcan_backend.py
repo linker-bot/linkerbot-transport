@@ -30,7 +30,7 @@ import threading
 
 import can
 
-from linkerbot.exceptions import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
 
 from .types import (
     CANFD_DEFAULT_DATA_BAUD,

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from linkerbot.exceptions import ValidationError
+from linkerbot_transport.errors import ValidationError
 
 CANFD_MAX_DATA_LENGTH = 64
 CANFD_MAX_DLC = 15

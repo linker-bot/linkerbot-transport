@@ -7,7 +7,7 @@ from contextlib import contextmanager
 
 import can
 
-from linkerbot.exceptions import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
 
 from .types import CanInterface
 

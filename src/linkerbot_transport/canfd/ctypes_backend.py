@@ -26,7 +26,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot_transport.errors import CANError, ValidationError
 
 from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
 
