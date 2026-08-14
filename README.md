@@ -16,8 +16,8 @@ pip install "linkerbot-transport[can]"
 pip install "linkerbot-transport[canfd]"
 ```
 
-The dependency-free base package can be installed for error types, contracts
-and test doubles:
+The dependency-free base package can be installed for error types and
+concurrency primitives:
 
 ```bash
 pip install linkerbot-transport
