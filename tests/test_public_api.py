@@ -16,6 +16,7 @@ from linkerbot.comm.canfd import (
 from linkerbot.exceptions import TransportError as LegacyTransportError
 from linkerbot.queue import IterableQueue as LegacyIterableQueue
 from linkerbot.relay import DataRelay as LegacyDataRelay
+from linkerbot_transport import ManagedMessageTransport
 from linkerbot_transport.can import CANMessageDispatcher
 from linkerbot_transport.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot_transport.errors import TransportError
@@ -31,6 +32,10 @@ def test_compatibility_exports_are_canonical_objects() -> None:
     assert LegacyTransportError is TransportError
     assert LegacyIterableQueue is IterableQueue
     assert LegacyDataRelay is DataRelay
+
+
+def test_managed_transport_is_available_from_package_root() -> None:
+    assert ManagedMessageTransport.__module__ == "linkerbot_transport._managed"
 
 
 def test_base_import_does_not_require_python_can() -> None:

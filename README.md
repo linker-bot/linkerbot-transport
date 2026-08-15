@@ -33,5 +33,26 @@ from linkerbot_transport.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot_transport.errors import TransportError
 ```
 
+Modern transports have an explicit lifecycle. Construction does not open a
+device or start worker threads:
+
+```python
+from linkerbot_transport.can import CANTransport
+
+transport = CANTransport("can0")
+transport.open()
+try:
+    health = transport.get_health()
+finally:
+    transport.close()
+```
+
+Use `SharedTransportPool` when several devices share the same physical channel.
+The first lease opens the transport and the final lease closes it. Recovery
+replaces the connection and never replays messages from an earlier generation.
+
+The legacy dispatcher classes still open immediately when constructed. They
+remain available only to preserve existing SDK behavior during migration.
+
 The historical `linkerbot.comm`, `linkerbot.exceptions`, `linkerbot.queue` and
 `linkerbot.relay` imports remain available during the compatibility period.
