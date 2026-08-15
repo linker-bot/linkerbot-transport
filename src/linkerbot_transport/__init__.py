@@ -1,5 +1,6 @@
 """Physical transports and shared runtime primitives for Linkerbot SDKs."""
 
+from ._managed import ManagedMessageTransport
 from .contracts import (
     MessageTransport,
     TransportHealth,
@@ -39,6 +40,7 @@ __all__ = [
     "HandSDKError",
     "IterableQueue",
     "LinkerbotError",
+    "ManagedMessageTransport",
     "MessageTransport",
     "QueueFullError",
     "SDKError",
