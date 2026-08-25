@@ -58,5 +58,10 @@ the caller must distinguish queue admission from physical backend success. A
 failed batch fails every receipt without retrying, because partial delivery is
 not observable and replaying control frames may be unsafe.
 
+CAN FD messages default to FrameType `0x04` (FD without bit-rate switching).
+Set `frame_type=0x0C` explicitly only for devices that support BRS. A message
+with `frame_type=None` inherits the vendor interface configuration; SocketCAN
+inherits the backend's `fd` mode and keeps BRS disabled.
+
 The historical `linkerbot.comm`, `linkerbot.exceptions`, `linkerbot.queue` and
 `linkerbot.relay` imports remain available during the compatibility period.

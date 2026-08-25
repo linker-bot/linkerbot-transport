@@ -163,7 +163,6 @@ def test_send_translates_message_to_vendor_frame(
         arbitration_id=0x123456,
         data=b"abc",
         is_extended_id=True,
-        frame_type=0x04,
     )
 
     interface.send(message, timeout_ms=25)
@@ -177,6 +176,21 @@ def test_send_translates_message_to_vendor_frame(
     assert bytes(frame.Data[:3]) == b"abc"
     assert count == 1
     assert timeout_ms == 25
+
+
+def test_send_inherits_configured_brs_frame_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lib = FakeLibrary()
+    monkeypatch.setattr(backend, "_load_library", lambda library_path: lib)
+    interface = backend.CANFDInterface(
+        config=CANFDConfigOptions(frame_type=0x0C)
+    )
+
+    interface.send(CANFDMessage(arbitration_id=1, data=b"x"))
+
+    frame = lib.CANFD_Transmit.calls[0][2]._obj
+    assert frame.FrameType == 0x0C
 
 
 @pytest.mark.parametrize("status", [0, -1, 2])
