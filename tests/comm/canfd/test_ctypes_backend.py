@@ -1,6 +1,6 @@
 import ctypes
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,21 @@ def make_interface(
 ) -> backend.CANFDInterface:
     monkeypatch.setattr(backend, "_load_library", lambda library_path: lib)
     return backend.CANFDInterface()
+
+
+@pytest.fixture
+def isolated_library_caches() -> Iterator[None]:
+    with backend._library_load_lock:
+        backend._library_handle_cache.clear()
+    with backend._dependency_load_lock:
+        backend._dependency_preload_attempted.clear()
+        backend._dependency_handle_cache.clear()
+    yield
+    with backend._library_load_lock:
+        backend._library_handle_cache.clear()
+    with backend._dependency_load_lock:
+        backend._dependency_preload_attempted.clear()
+        backend._dependency_handle_cache.clear()
 
 
 def test_ctypes_struct_fields() -> None:
@@ -183,9 +198,7 @@ def test_send_inherits_configured_brs_frame_type(
 ) -> None:
     lib = FakeLibrary()
     monkeypatch.setattr(backend, "_load_library", lambda library_path: lib)
-    interface = backend.CANFDInterface(
-        config=CANFDConfigOptions(frame_type=0x0C)
-    )
+    interface = backend.CANFDInterface(config=CANFDConfigOptions(frame_type=0x0C))
 
     interface.send(CANFDMessage(arbitration_id=1, data=b"x"))
 
@@ -322,6 +335,192 @@ def test_load_library_error_mentions_configuration(
 
     with pytest.raises(CANError, match="LINKERBOT_CANFD_LIB"):
         backend._load_library(None)
+
+
+def test_repeated_interfaces_share_cached_handle_but_keep_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_library_caches: None,
+) -> None:
+    path = tmp_path / "libcanbus.so"
+    path.touch()
+    lib = FakeLibrary()
+    lib._name = str(path)
+    load_calls: list[str] = []
+
+    def load(candidate: str) -> FakeLibrary:
+        load_calls.append(candidate)
+        return lib
+
+    monkeypatch.setattr(backend, "_preload_vendor_dependencies", lambda: None)
+    monkeypatch.setattr(backend, "_ctypes_loader", lambda: load)
+
+    first = backend.CANFDInterface(library_path=path)
+    first.close()
+    second = backend.CANFDInterface(library_path=path)
+    second.close()
+
+    assert load_calls == [str(path)]
+    assert len(lib.LibCANbus_Init.calls) == 2
+    assert len(lib.LibCANbus_Exit.calls) == 2
+
+
+def test_library_cache_merges_symlink_with_real_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_library_caches: None,
+) -> None:
+    real_path = tmp_path / "libcanbus.so.1"
+    alias_path = tmp_path / "libcanbus.so"
+    real_path.touch()
+    alias_path.symlink_to(real_path)
+    loaded: list[object] = []
+
+    def load(candidate: str) -> object:
+        handle = object()
+        loaded.append(handle)
+        return handle
+
+    monkeypatch.setattr(backend, "_preload_vendor_dependencies", lambda: None)
+    monkeypatch.setattr(backend, "_ctypes_loader", lambda: load)
+
+    via_alias = backend._load_library(alias_path)
+    via_real_path = backend._load_library(real_path)
+
+    assert via_alias is via_real_path
+    assert loaded == [via_alias]
+
+
+def test_library_cache_keeps_different_real_paths_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_library_caches: None,
+) -> None:
+    first_path = tmp_path / "a" / "libcanbus.so"
+    second_path = tmp_path / "b" / "libcanbus.so"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    first_path.touch()
+    second_path.touch()
+    loaded: list[object] = []
+
+    def load(candidate: str) -> object:
+        handle = object()
+        loaded.append(handle)
+        return handle
+
+    monkeypatch.setattr(backend, "_preload_vendor_dependencies", lambda: None)
+    monkeypatch.setattr(backend, "_ctypes_loader", lambda: load)
+
+    first = backend._load_library(first_path)
+    second = backend._load_library(second_path)
+
+    assert first is not second
+    assert loaded == [first, second]
+
+
+def test_concurrent_library_loads_create_one_cached_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_library_caches: None,
+) -> None:
+    path = tmp_path / "libcanbus.so"
+    path.touch()
+    start = threading.Barrier(9)
+    load_calls: list[str] = []
+    handle = object()
+
+    def load(candidate: str) -> object:
+        load_calls.append(candidate)
+        return handle
+
+    monkeypatch.setattr(backend, "_preload_vendor_dependencies", lambda: None)
+    monkeypatch.setattr(backend, "_ctypes_loader", lambda: load)
+    results: list[object] = []
+
+    def load_from_thread() -> None:
+        start.wait()
+        results.append(backend._load_library(path))
+
+    threads = [threading.Thread(target=load_from_thread) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert load_calls == [str(path)]
+    assert len(results) == 8
+    assert all(result is handle for result in results)
+
+
+def test_linux_dependency_preload_is_attempted_once_and_retained(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_library_caches: None,
+) -> None:
+    handle = object()
+    calls: list[tuple[str, int]] = []
+
+    def load(name: str, *, mode: int) -> object:
+        calls.append((name, mode))
+        return handle
+
+    monkeypatch.setattr(backend.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(backend.ctypes, "CDLL", load)
+
+    backend._preload_vendor_dependencies()
+    backend._preload_vendor_dependencies()
+
+    key = backend._canonical_library_key(backend._LINUX_USB_LIBRARY_NAME)
+    assert calls == [(backend._LINUX_USB_LIBRARY_NAME, backend.ctypes.RTLD_GLOBAL)]
+    assert backend._dependency_handle_cache == {key: handle}
+
+
+def test_linux_dependency_preload_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_library_caches: None,
+) -> None:
+    calls: list[str] = []
+
+    def fail(name: str, *, mode: int) -> object:
+        _ = mode
+        calls.append(name)
+        raise OSError("missing")
+
+    monkeypatch.setattr(backend.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(backend.ctypes, "CDLL", fail)
+
+    backend._preload_vendor_dependencies()
+    backend._preload_vendor_dependencies()
+
+    assert calls == [backend._LINUX_USB_LIBRARY_NAME]
+    assert backend._dependency_handle_cache == {}
+
+
+def test_windows_loader_uses_one_cached_windll_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_library_caches: None,
+) -> None:
+    path = tmp_path / "HCanbus.dll"
+    path.touch()
+    handle = object()
+    calls: list[str] = []
+
+    def load(candidate: str) -> object:
+        calls.append(candidate)
+        return handle
+
+    monkeypatch.setattr(backend.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(backend.ctypes, "WinDLL", load, raising=False)
+
+    first = backend._load_library(path)
+    second = backend._load_library(path)
+
+    assert first is handle
+    assert second is handle
+    assert calls == [str(path)]
 
 
 def test_close_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
