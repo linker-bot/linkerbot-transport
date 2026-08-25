@@ -6,6 +6,7 @@ from linkerbot_transport.canfd import (
     CANFDInterface,
     CANFDMessage,
     CANFDMessageDispatcher,
+    CANFDSendReceipt,
 )
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "CANFDInterface",
     "CANFDMessage",
     "CANFDMessageDispatcher",
+    "CANFDSendReceipt",
     "CANMessageDispatcher",
     "CanInterface",
 ]

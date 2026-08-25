@@ -53,6 +53,10 @@ replaces the connection and never replays messages from an earlier generation.
 
 The legacy dispatcher classes still open immediately when constructed. They
 remain available only to preserve existing SDK behavior during migration.
+Queued CAN FD sends return a receipt; call `receipt.result(timeout=...)` when
+the caller must distinguish queue admission from physical backend success. A
+failed batch fails every receipt without retrying, because partial delivery is
+not observable and replaying control frames may be unsafe.
 
 The historical `linkerbot.comm`, `linkerbot.exceptions`, `linkerbot.queue` and
 `linkerbot.relay` imports remain available during the compatibility period.

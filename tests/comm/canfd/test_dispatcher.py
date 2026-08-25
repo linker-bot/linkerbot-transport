@@ -2,12 +2,13 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from typing import Protocol
 
 import pytest
 
 from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot.comm.canfd import dispatcher as dispatcher_module
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot.exceptions import CANError, ClosedError, ValidationError
 
 
 class FakeInterface:
@@ -43,11 +44,15 @@ class FakeInterface:
         self.close_event.set()
 
 
+class _MessageEnvelope(Protocol):
+    message: CANFDMessage
+
+
 class BlockingPutQueue:
     def __init__(self) -> None:
         self.put_entered = threading.Event()
         self.release_put = threading.Event()
-        self.items: list[CANFDMessage] = []
+        self.items: list[_MessageEnvelope] = []
 
     def get(self, timeout: float | None = None) -> CANFDMessage:
         time.sleep(min(timeout or 0.001, 0.001))
@@ -56,7 +61,7 @@ class BlockingPutQueue:
     def get_nowait(self) -> CANFDMessage:
         raise queue.Empty
 
-    def put_nowait(self, message: CANFDMessage) -> None:
+    def put_nowait(self, message: _MessageEnvelope) -> None:
         self.put_entered.set()
         self.release_put.wait()
         self.items.append(message)
@@ -107,10 +112,104 @@ def test_send_queues_message_for_fake_interface() -> None:
     message = CANFDMessage(arbitration_id=1, data=b"abc")
 
     try:
-        dispatcher.send(message)
-        wait_until(lambda: interface.sent == [message])
+        receipt = dispatcher.send(message)
+        assert receipt.cancel() is False
+        assert receipt.result(timeout=1.0) is None
+        assert interface.sent == [message]
     finally:
         dispatcher.stop()
+
+
+def test_send_receipt_preserves_background_sdk_error() -> None:
+    interface = FakeInterface()
+    expected = ValidationError("invalid CANFD frame")
+    interface.send_error = expected
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+
+    try:
+        receipt = dispatcher.send(CANFDMessage(arbitration_id=1, data=b"x"))
+        with pytest.raises(ValidationError) as raised:
+            receipt.result(timeout=1.0)
+        assert raised.value is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_send_receipt_wraps_background_system_error() -> None:
+    interface = FakeInterface()
+    expected = OSError("write failed")
+    interface.send_error = expected
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+
+    try:
+        receipt = dispatcher.send(CANFDMessage(arbitration_id=1, data=b"x"))
+        with pytest.raises(CANError, match="background send failed") as raised:
+            receipt.result(timeout=1.0)
+        assert raised.value.cause is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_fatal_send_failure_fails_current_and_queued_receipts() -> None:
+    class GatedFailingInterface(FakeInterface):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+
+        def send(self, message: CANFDMessage, timeout_ms: int = 10) -> None:
+            _ = message, timeout_ms
+            self.send_started.set()
+            assert self.release_send.wait(timeout=1.0)
+            raise CANError("physical send failed")
+
+    interface = GatedFailingInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface, max_consecutive_errors=1)
+    first = dispatcher.send(CANFDMessage(arbitration_id=1, data=b"a"))
+    assert interface.send_started.wait(timeout=1.0)
+    second = dispatcher.send(CANFDMessage(arbitration_id=2, data=b"b"))
+    third = dispatcher.send(CANFDMessage(arbitration_id=3, data=b"c"))
+    interface.release_send.set()
+
+    try:
+        for receipt in (first, second, third):
+            with pytest.raises(CANError):
+                receipt.result(timeout=1.0)
+        wait_until(lambda: not dispatcher._running)
+    finally:
+        dispatcher.stop()
+
+
+def test_stop_fails_in_flight_and_queued_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CloseReleasesSendInterface(FakeInterface):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+
+        def send(self, message: CANFDMessage, timeout_ms: int = 10) -> None:
+            self.send_started.set()
+            self.release_send.wait(timeout=1.0)
+            super().send(message, timeout_ms)
+
+        def close(self) -> None:
+            self.release_send.set()
+            super().close()
+
+    monkeypatch.setattr(dispatcher_module, "THREAD_JOIN_TIMEOUT_S", 0.01)
+    interface = CloseReleasesSendInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+    first = dispatcher.send(CANFDMessage(arbitration_id=1, data=b"a"))
+    assert interface.send_started.wait(timeout=1.0)
+    second = dispatcher.send(CANFDMessage(arbitration_id=2, data=b"b"))
+
+    dispatcher.stop()
+
+    for receipt in (first, second):
+        with pytest.raises(ClosedError, match="stopped before queued send completed"):
+            receipt.result(timeout=0)
 
 
 def test_callback_exception_does_not_stop_other_callbacks() -> None:
@@ -418,7 +517,8 @@ def test_send_and_stop_are_atomic_at_queue_boundary() -> None:
     assert not stopper.is_alive()
     assert send_errors == []
     assert stop_errors == []
-    assert blocking_queue.items == [message]
+    assert len(blocking_queue.items) == 1
+    assert blocking_queue.items[0].message is message
     assert interface.close_calls == 1
 
 

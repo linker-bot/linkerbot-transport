@@ -5,10 +5,17 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
-from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import (
+    CANError,
+    ClosedError,
+    HandSDKError,
+    ValidationError,
+)
 
 from .ctypes_backend import CANFDInterface
 from .types import CANFDBackend, CANFDConfigOptions, CANFDMessage
@@ -23,6 +30,21 @@ THREAD_JOIN_TIMEOUT_S = 1.0
 # stutter cascade into ~5.5 s of bus silence before the dispatcher gave up.
 ERROR_BACKOFF_BASE_S = 0.005
 ERROR_BACKOFF_MAX_S = 0.05
+
+
+class CANFDSendReceipt(Future[None]):
+    """Future completed after one queued CAN FD frame is physically sent.
+
+    Queued physical sends cannot be cancelled reliably. Receipts therefore
+    enter the running state before ``send()`` returns and ``cancel()`` returns
+    ``False``.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedSend:
+    message: CANFDMessage
+    receipt: CANFDSendReceipt
 
 
 class _ImmediateDispatchState:
@@ -103,9 +125,11 @@ class CANFDMessageDispatcher:
         self._subscribers_lock = threading.Lock()
         self._running = True
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._send_queue: queue.Queue[CANFDMessage] = queue.Queue(
+        self._send_queue: queue.Queue[_QueuedSend] = queue.Queue(
             maxsize=self.SEND_QUEUE_SIZE
         )
+        self._receipt_lock = threading.Lock()
+        self._pending_receipts: set[CANFDSendReceipt] = set()
         self._on_bus_error = on_bus_error
         self._max_consecutive_errors = max_consecutive_errors
         self._bus_error: Exception | None = None
@@ -136,6 +160,7 @@ class CANFDMessageDispatcher:
             self._error_reported = True
             self._running = False
             self._bus_error = error
+        self._fail_all_receipts(_send_error(error, "CANFD bus unavailable"))
         self._logger.error(f"CANFD bus fatal error, stopping dispatcher: {error}")
         if self._on_bus_error is not None:
             try:
@@ -248,7 +273,7 @@ class CANFDMessageDispatcher:
             # up to SEND_BATCH_MAX, but never block — if there's only one
             # frame ready, send it immediately rather than introducing latency
             # by waiting for more.
-            batch: list[CANFDMessage] = [first]
+            batch: list[_QueuedSend] = [first]
             if send_batch is not None and self.SEND_BATCH_MAX > 1:
                 while len(batch) < self.SEND_BATCH_MAX:
                     try:
@@ -261,7 +286,7 @@ class CANFDMessageDispatcher:
                         with self._error_lock:
                             if not self._running:
                                 return
-                        send_batch(batch)
+                        send_batch([queued.message for queued in batch])
                 else:
                     # Either backend lacks batch support, or only one frame
                     # was ready — both paths fall through to per-frame send.
@@ -269,9 +294,11 @@ class CANFDMessageDispatcher:
                         with self._error_lock:
                             if not self._running:
                                 return
-                        for message in batch:
-                            self._interface.send(message)
+                        for queued in batch:
+                            self._interface.send(queued.message)
                 consecutive_errors = 0
+                for queued in batch:
+                    self._complete_receipt(queued.receipt)
                 # Optional pacing for backward compatibility; default 0 means
                 # rely entirely on the vendor USB stack. A previous version
                 # spun `while time.monotonic() < deadline: pass` here which
@@ -279,6 +306,9 @@ class CANFDMessageDispatcher:
                 if self.SEND_INTERVAL_S > 0:
                     time.sleep(self.SEND_INTERVAL_S)
             except Exception as error:
+                send_error = _send_error(error, "CANFD background send failed")
+                for queued in batch:
+                    self._fail_receipt(queued.receipt, send_error)
                 if not self._is_running():
                     return
                 consecutive_errors += 1
@@ -298,8 +328,14 @@ class CANFDMessageDispatcher:
                 )
                 time.sleep(_error_backoff_s(consecutive_errors))
 
-    def send(self, message: CANFDMessage) -> None:
-        """Enqueue a CANFD message for rate-limited transmission."""
+    def send(self, message: CANFDMessage) -> CANFDSendReceipt:
+        """Enqueue a frame and return its physical-transmission receipt.
+
+        Enqueue success does not imply that the backend accepted the frame.
+        Call ``receipt.result(timeout=...)`` to observe the background result.
+        A failed batch marks every receipt in that batch as failed because the
+        backend cannot report which frames, if any, reached the bus.
+        """
         state: _ImmediateDispatchState | None = getattr(
             self._immediate_dispatch, "state", None
         )
@@ -307,15 +343,22 @@ class CANFDMessageDispatcher:
             if state.claim_result is None:
                 state.claim_result = state.claim_dispatch()
             if not state.claim_result:
-                return
+                return _completed_receipt()
             self.send_now(message)
             if not state.marked:
                 state.mark_dispatched()
                 state.marked = True
-            return
+            return _completed_receipt()
+        receipt = CANFDSendReceipt()
         with self._error_lock:
             self._raise_if_cannot_send_locked()
-            self._send_queue.put_nowait(message)
+            self._register_receipt(receipt)
+            try:
+                self._send_queue.put_nowait(_QueuedSend(message, receipt))
+            except BaseException:
+                self._discard_receipt(receipt)
+                raise
+        return receipt
 
     def send_now(self, message: CANFDMessage) -> None:
         """Synchronously send a frame for lifecycle-aware command scheduling."""
@@ -375,6 +418,9 @@ class CANFDMessageDispatcher:
         with self._error_lock:
             self._error_reported = True
             self._running = False
+        self._fail_all_receipts(
+            ClosedError("CANFD dispatcher stopped before queued send completed")
+        )
         with self._subscribers_lock:
             self._subscribers.clear()
             self._filtered_subscribers.clear()
@@ -408,6 +454,39 @@ class CANFDMessageDispatcher:
             raise CANError(f"CANFD bus unavailable: {self._bus_error}")
         if not self._running:
             raise RuntimeError("Cannot send on a stopped CANFDMessageDispatcher")
+
+    def _register_receipt(self, receipt: CANFDSendReceipt) -> None:
+        with self._receipt_lock:
+            receipt.set_running_or_notify_cancel()
+            self._pending_receipts.add(receipt)
+
+    def _discard_receipt(self, receipt: CANFDSendReceipt) -> None:
+        with self._receipt_lock:
+            self._pending_receipts.discard(receipt)
+
+    def _complete_receipt(self, receipt: CANFDSendReceipt) -> None:
+        if not self._take_receipt(receipt):
+            return
+        receipt.set_result(None)
+
+    def _fail_receipt(self, receipt: CANFDSendReceipt, error: BaseException) -> None:
+        if not self._take_receipt(receipt):
+            return
+        receipt.set_exception(error)
+
+    def _take_receipt(self, receipt: CANFDSendReceipt) -> bool:
+        with self._receipt_lock:
+            if receipt not in self._pending_receipts:
+                return False
+            self._pending_receipts.remove(receipt)
+            return True
+
+    def _fail_all_receipts(self, error: BaseException) -> None:
+        with self._receipt_lock:
+            receipts = tuple(self._pending_receipts)
+            self._pending_receipts.clear()
+        for receipt in receipts:
+            receipt.set_exception(error)
 
     def _join_worker_threads(self, current: threading.Thread) -> list[threading.Thread]:
         running_threads: list[threading.Thread] = []
@@ -462,3 +541,15 @@ class CANFDMessageDispatcher:
 
 def _error_backoff_s(consecutive_errors: int) -> float:
     return min(ERROR_BACKOFF_BASE_S * consecutive_errors, ERROR_BACKOFF_MAX_S)
+
+
+def _completed_receipt() -> CANFDSendReceipt:
+    receipt = CANFDSendReceipt()
+    receipt.set_result(None)
+    return receipt
+
+
+def _send_error(error: BaseException, operation: str) -> HandSDKError:
+    if isinstance(error, HandSDKError):
+        return error
+    return CANError(f"{operation}: {error}", cause=error)

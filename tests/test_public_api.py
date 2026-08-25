@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 from linkerbot.comm import CANFDMessageDispatcher as LegacyTopLevelCANFDDispatcher
+from linkerbot.comm import CANFDSendReceipt as LegacyTopLevelCANFDSendReceipt
 from linkerbot.comm.can import CANMessageDispatcher as LegacyCANDispatcher
 from linkerbot.comm.canfd import (
     CANFDMessage as LegacyCANFDMessage,
@@ -13,12 +14,17 @@ from linkerbot.comm.canfd import (
 from linkerbot.comm.canfd import (
     CANFDMessageDispatcher as LegacyCANFDDispatcher,
 )
+from linkerbot.comm.canfd import CANFDSendReceipt as LegacyCANFDSendReceipt
 from linkerbot.exceptions import TransportError as LegacyTransportError
 from linkerbot.queue import IterableQueue as LegacyIterableQueue
 from linkerbot.relay import DataRelay as LegacyDataRelay
 from linkerbot_transport import ManagedMessageTransport
 from linkerbot_transport.can import CANMessageDispatcher
-from linkerbot_transport.canfd import CANFDMessage, CANFDMessageDispatcher
+from linkerbot_transport.canfd import (
+    CANFDMessage,
+    CANFDMessageDispatcher,
+    CANFDSendReceipt,
+)
 from linkerbot_transport.errors import TransportError
 from linkerbot_transport.queue import IterableQueue
 from linkerbot_transport.relay import DataRelay
@@ -28,7 +34,9 @@ def test_compatibility_exports_are_canonical_objects() -> None:
     assert LegacyCANDispatcher is CANMessageDispatcher
     assert LegacyCANFDMessage is CANFDMessage
     assert LegacyCANFDDispatcher is CANFDMessageDispatcher
+    assert LegacyCANFDSendReceipt is CANFDSendReceipt
     assert LegacyTopLevelCANFDDispatcher is CANFDMessageDispatcher
+    assert LegacyTopLevelCANFDSendReceipt is CANFDSendReceipt
     assert LegacyTransportError is TransportError
     assert LegacyIterableQueue is IterableQueue
     assert LegacyDataRelay is DataRelay
