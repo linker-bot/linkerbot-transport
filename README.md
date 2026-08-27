@@ -79,6 +79,23 @@ finally:
     transport.close()
 ```
 
+Protocols whose responses use several arbitration IDs can register them as one
+atomic route group. Every exact key still uses one hash lookup, while all
+matching frames enter the same bounded queue in arrival order:
+
+```python
+routes = transport.subscribe_routes(
+    (
+        CANRouteKey(arbitration_id=0x02000000, is_extended_id=True),
+        CANRouteKey(arbitration_id=0x02006000, is_extended_id=True),
+    ),
+    queue_capacity=64,
+)
+```
+
+The capacity applies to the combined stream. Registration either claims every
+key or none, and closing the subscription releases the complete group.
+
 `RoutedMessage` also contains a monotonic receive timestamp and per-generation
 sequence number. A full inbox drops the newly received frame and increments
 the route and transport overflow counters. Route misses, key errors, stale

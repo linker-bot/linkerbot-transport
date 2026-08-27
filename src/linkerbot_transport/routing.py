@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Generic, TypeVar
@@ -68,6 +68,7 @@ class RouteHealth(Generic[RouteKeyT]):
     delivered: int
     overflows: int
     dropped_on_close: int
+    route_keys: tuple[RouteKeyT, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,13 +99,13 @@ class _OfferResult(Enum):
 class _RouteState(Generic[MessageT, RouteKeyT]):
     def __init__(
         self,
-        route_key: RouteKeyT,
+        route_keys: tuple[RouteKeyT, ...],
         generation: int,
         capacity: int,
         router_lock: threading.RLock,
         on_dequeue: Callable[[], None],
     ) -> None:
-        self.route_key = route_key
+        self.route_keys = route_keys
         self.generation = generation
         self.capacity = capacity
         self._on_dequeue = on_dequeue
@@ -115,6 +116,12 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
         self._delivered = 0
         self._overflows = 0
         self._dropped_on_close = 0
+
+    @property
+    def route_key(self) -> RouteKeyT:
+        """Return the primary key retained for the single-route API."""
+
+        return self.route_keys[0]
 
     def offer(self, message: RoutedMessage[MessageT, RouteKeyT]) -> _OfferResult:
         with self._condition:
@@ -165,6 +172,7 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
                 delivered=self._delivered,
                 overflows=self._overflows,
                 dropped_on_close=self._dropped_on_close,
+                route_keys=self.route_keys,
             )
 
 
@@ -183,9 +191,15 @@ class RouteSubscription(Generic[MessageT, RouteKeyT]):
 
     @property
     def route_key(self) -> RouteKeyT:
-        """Return the exact key owned by this subscription."""
+        """Return the primary exact key owned by this subscription."""
 
         return self._state.route_key
+
+    @property
+    def route_keys(self) -> tuple[RouteKeyT, ...]:
+        """Return every exact key feeding this subscription's shared inbox."""
+
+        return self._state.route_keys
 
     @property
     def generation(self) -> int:
@@ -316,6 +330,36 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
         """Register one exclusive bounded inbox for ``route_key``."""
 
         _validate_hashable(route_key, "route_key")
+        return self._subscribe((route_key,), queue_capacity=queue_capacity)
+
+    def subscribe_routes(
+        self,
+        route_keys: Iterable[RouteKeyT],
+        *,
+        queue_capacity: int | None = None,
+    ) -> RouteSubscription[MessageT, RouteKeyT]:
+        """Atomically route several exact keys into one bounded inbox.
+
+        Registration consumes one route-registry slot per exact key while the
+        queue capacity applies to the combined stream. No key is registered if
+        validation, exclusivity, or registry-capacity checks fail.
+        """
+
+        keys = tuple(route_keys)
+        if not keys:
+            raise ValidationError("route_keys must not be empty")
+        for route_key in keys:
+            _validate_hashable(route_key, "route_keys item")
+        if len(set(keys)) != len(keys):
+            raise ValidationError("route_keys must not contain duplicates")
+        return self._subscribe(keys, queue_capacity=queue_capacity)
+
+    def _subscribe(
+        self,
+        route_keys: tuple[RouteKeyT, ...],
+        *,
+        queue_capacity: int | None,
+    ) -> RouteSubscription[MessageT, RouteKeyT]:
         capacity = self._default_queue_capacity
         if queue_capacity is not None:
             _validate_positive_int(queue_capacity, "queue_capacity")
@@ -323,19 +367,20 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
         with self._lock:
             if not self._running:
                 raise ClosedError("receive router is closed")
-            if route_key in self._routes:
-                raise StateError("receive route is already registered")
-            if len(self._routes) >= self._max_routes:
+            if any(route_key in self._routes for route_key in route_keys):
+                raise StateError("one or more receive routes are already registered")
+            if len(self._routes) + len(route_keys) > self._max_routes:
                 self._registration_rejections += 1
                 raise QueueFullError("receive route registry is full")
             state = _RouteState(
-                route_key,
+                route_keys,
                 self._generation,
                 capacity,
                 self._lock,
                 self._on_dequeue,
             )
-            self._routes[route_key] = state
+            for route_key in route_keys:
+                self._routes[route_key] = state
             return RouteSubscription(self, state)
 
     def route(self, message: MessageT, *, generation: int) -> bool:
@@ -406,9 +451,9 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
 
     def _unregister(self, state: _RouteState[MessageT, RouteKeyT]) -> None:
         with self._lock:
-            current = self._routes.get(state.route_key)
-            if current is state:
-                del self._routes[state.route_key]
+            for route_key in state.route_keys:
+                if self._routes.get(route_key) is state:
+                    del self._routes[route_key]
             dropped = state.close(ClosedError("receive route is closed"))
             self._queue_depth -= dropped
             self._dropped_on_close += dropped
@@ -424,7 +469,7 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             if not self._running and not self._routes:
                 return
             self._running = False
-            states = tuple(self._routes.values())
+            states = tuple(dict.fromkeys(self._routes.values()))
             self._routes.clear()
             for state in states:
                 dropped = state.close(error)

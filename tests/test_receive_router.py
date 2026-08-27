@@ -113,6 +113,82 @@ def test_registry_is_bounded_and_route_keys_are_exclusive() -> None:
     router.close()
 
 
+def test_route_group_preserves_arrival_order_in_one_shared_inbox() -> None:
+    router = ReceiveRouter[tuple[str, int], str](lambda message: message[0])
+    router.open(generation=3)
+    route = router.subscribe_routes(("identity", "angles", "faults"))
+
+    assert route.route_key == "identity"
+    assert route.route_keys == ("identity", "angles", "faults")
+    assert route.get_health().route_keys == route.route_keys
+    assert router.get_health().route_count == 3
+
+    assert router.route(("faults", 1), generation=3)
+    assert router.route(("angles", 2), generation=3)
+    assert router.route(("identity", 3), generation=3)
+
+    assert [route.receive(timeout_s=0).message for _ in range(3)] == [
+        ("faults", 1),
+        ("angles", 2),
+        ("identity", 3),
+    ]
+    router.close()
+
+
+def test_route_group_uses_one_combined_capacity_and_closes_atomically() -> None:
+    router = ReceiveRouter[str, str](lambda message: message)
+    router.open(generation=1)
+    route = router.subscribe_routes(("a", "b"), queue_capacity=2)
+
+    assert router.route("a", generation=1)
+    assert router.route("b", generation=1)
+    assert not router.route("a", generation=1)
+    route.close()
+
+    health = router.get_health()
+    assert health.route_count == 0
+    assert health.queue_depth == 0
+    assert health.dropped_on_close == 2
+    assert route.get_health().overflows == 1
+    assert not router.route("b", generation=1)
+    router.close()
+
+
+def test_route_group_registration_failure_leaves_no_partial_routes() -> None:
+    router = ReceiveRouter[str, str](lambda message: message, max_routes=3)
+    router.open(generation=1)
+    existing = router.subscribe("claimed")
+
+    with pytest.raises(StateError, match="already registered"):
+        router.subscribe_routes(("free", "claimed"))
+    assert router.get_health().route_count == 1
+
+    with pytest.raises(QueueFullError, match="registry is full"):
+        router.subscribe_routes(("one", "two", "three"))
+    assert router.get_health().route_count == 1
+    assert router.get_health().registration_rejections == 1
+
+    replacement = router.subscribe_routes(("free", "other"))
+    assert router.get_health().route_count == 3
+    replacement.close()
+    existing.close()
+    router.close()
+
+
+@pytest.mark.parametrize("route_keys", [(), ("a", "a")])
+def test_route_group_rejects_empty_or_duplicate_keys(
+    route_keys: tuple[str, ...],
+) -> None:
+    router = ReceiveRouter[str, str](lambda message: message)
+    router.open(generation=1)
+
+    with pytest.raises(ValidationError):
+        router.subscribe_routes(route_keys)
+
+    assert router.get_health().route_count == 0
+    router.close()
+
+
 def test_subscription_close_discards_queue_and_wakes_blocked_receive() -> None:
     router = ReceiveRouter[int, int](lambda message: message)
     router.open(generation=1)
@@ -207,6 +283,21 @@ def test_repeated_lifecycle_does_not_retain_routes() -> None:
         router.open(generation=generation)
         route = router.subscribe(generation)
         assert router.route(generation, generation=generation)
+        router.close()
+        assert not route.get_health().active
+        assert router.get_health().route_count == 0
+        assert router.get_health().queue_depth == 0
+
+    assert router.get_health().dropped_on_close == 100
+
+
+def test_repeated_group_lifecycle_does_not_retain_routes() -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+
+    for generation in range(1, 101):
+        router.open(generation=generation)
+        route = router.subscribe_routes((1, 2, 3))
+        assert router.route(2, generation=generation)
         router.close()
         assert not route.get_health().active
         assert router.get_health().route_count == 0

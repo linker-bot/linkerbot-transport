@@ -181,6 +181,22 @@ def test_receive_overflow_and_queue_depth_are_reported_in_transport_health() -> 
     transport.close()
 
 
+def test_managed_transport_routes_many_exact_keys_to_one_subscription() -> None:
+    transport = FakeTransport[str]()
+    transport.open()
+    route = transport.subscribe_routes(("angles", "faults"), queue_capacity=2)
+
+    transport.emit("faults")
+    transport.emit("angles")
+
+    assert route.receive(timeout_s=0).route_key == "faults"
+    assert route.receive(timeout_s=0).route_key == "angles"
+    assert transport.get_health().route_count == 2
+    route.close()
+    assert transport.get_health().route_count == 0
+    transport.close()
+
+
 def test_bus_failure_wakes_route_receiver_with_transport_error() -> None:
     transport = FakeTransport[int]()
     transport.open()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterable
 from typing import Generic, Protocol, TypeVar
 
 from .contracts import TransportHealth, TransportState
@@ -248,6 +248,21 @@ class ManagedMessageTransport(Generic[MessageT]):
             self._require_open_locked()
             return self._receive_router.subscribe(
                 route_key,
+                queue_capacity=queue_capacity,
+            )
+
+    def subscribe_routes(
+        self,
+        route_keys: Iterable[Hashable],
+        *,
+        queue_capacity: int | None = None,
+    ) -> RouteSubscription[MessageT, Hashable]:
+        """Open one shared bounded inbox for several exact receive routes."""
+
+        with self._state_lock:
+            self._require_open_locked()
+            return self._receive_router.subscribe_routes(
+                route_keys,
                 queue_capacity=queue_capacity,
             )
 
