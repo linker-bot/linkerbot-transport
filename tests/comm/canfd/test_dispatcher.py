@@ -8,7 +8,7 @@ import pytest
 
 from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot.comm.canfd import dispatcher as dispatcher_module
-from linkerbot.exceptions import CANError, ClosedError, ValidationError
+from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
 
 
 class FakeInterface:
@@ -146,6 +146,25 @@ def test_send_receipt_wraps_background_system_error() -> None:
         with pytest.raises(CANError, match="background send failed") as raised:
             receipt.result(timeout=1.0)
         assert raised.value.cause is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_send_queue_full_raises_stable_error() -> None:
+    class FullQueue:
+        def get(self, timeout: float | None = None) -> object:
+            time.sleep(min(timeout or 0.001, 0.001))
+            raise queue.Empty
+
+        def put_nowait(self, item: object) -> None:
+            _ = item
+            raise queue.Full
+
+    dispatcher = CANFDMessageDispatcher(interface=FakeInterface())
+    dispatcher._send_queue = FullQueue()  # ty: ignore[invalid-assignment]
+    try:
+        with pytest.raises(QueueFullError, match="send queue is full"):
+            dispatcher.send(CANFDMessage(arbitration_id=1, data=b"x"))
     finally:
         dispatcher.stop()
 

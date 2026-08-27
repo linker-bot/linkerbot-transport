@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .errors import ErrorCode
+from .receipts import SendReceipt
 
 MessageT = TypeVar("MessageT")
 
@@ -71,8 +72,8 @@ class TransportLifecycle(Protocol):
 class MessageTransport(TransportLifecycle, Protocol[MessageT]):
     """Callback-based transport for discrete protocol messages."""
 
-    def send(self, message: MessageT) -> None:
-        """Synchronously hand one message to the physical backend."""
+    def send(self, message: MessageT) -> SendReceipt:
+        """Accept one message and return its physical-send receipt."""
         ...
 
     def subscribe(self, callback: Callable[[MessageT], None]) -> None:
@@ -86,6 +87,7 @@ class MessageTransport(TransportLifecycle, Protocol[MessageT]):
 
 __all__ = [
     "MessageTransport",
+    "SendReceipt",
     "TransportHealth",
     "TransportLifecycle",
     "TransportState",

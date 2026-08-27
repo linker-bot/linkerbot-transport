@@ -17,6 +17,7 @@ from .errors import (
     ValidationError,
     normalize_error,
 )
+from .receipts import SendReceipt
 
 MessageT = TypeVar("MessageT")
 
@@ -195,8 +196,13 @@ class ManagedMessageTransport(Generic[MessageT]):
                 with self._state_lock:
                     self._reconnect_count += 1
 
-    def send(self, message: MessageT) -> None:
-        """Synchronously send through the dispatcher's serialized write path."""
+    def send(self, message: MessageT) -> SendReceipt:
+        """Send through the dispatcher and return an observable result.
+
+        Lifecycle admission failures still raise before a send is accepted.
+        Once accepted, physical backend failures complete the returned receipt
+        with a stable transport exception.
+        """
 
         with self._state_lock:
             dispatcher = self._require_open_locked()
@@ -204,10 +210,11 @@ class ManagedMessageTransport(Generic[MessageT]):
             dispatcher.send_now(message)
         except Exception as error:
             classified = self._record_error(error, faulted=False)
-            _raise_classified(classified, error)
+            return SendReceipt.failed(classified)
         with self._state_lock:
             self._last_successful_tx_s = self._monotonic()
             self._consecutive_errors = 0
+        return SendReceipt.completed()
 
     def subscribe(self, callback: Callable[[MessageT], None]) -> None:
         """Register a callback without opening the transport."""

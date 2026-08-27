@@ -1,3 +1,5 @@
+from linkerbot_transport.receipts import SendReceipt
+
 from .ctypes_backend import CanFDConfig, CANFDInterface, CanFDMsg, DevInfo
 from .dispatcher import CANFDMessageDispatcher, CANFDSendReceipt
 from .socketcan_backend import SocketCANFDBackend
@@ -27,6 +29,7 @@ __all__ = [
     "CanFDConfig",
     "CanFDMsg",
     "DevInfo",
+    "SendReceipt",
     "SocketCANFDBackend",
     "SocketCANFDTransport",
     "SocketCANFDTransportKey",
