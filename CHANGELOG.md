@@ -4,6 +4,9 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add an atomic replace-if-pending operation for keyed latest sends so protocol
+  runtimes never queue a replacement behind an already claimed transaction.
+
 ## 0.1.1 - 2026-08-28
 
 - Unify classic CAN, CAN FD, managed and fake transport sends on the observable

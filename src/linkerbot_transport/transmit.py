@@ -336,6 +336,66 @@ class TransmitArbiter(Generic[MessageT]):
             ),
         )
 
+    def replace_latest_if_pending(
+        self,
+        message: MessageT,
+        *,
+        endpoint_id: Hashable,
+        command_family: Hashable,
+        priority: int = 0,
+        deadline_at_s: float | None = None,
+    ) -> SendReceipt | None:
+        """Atomically replace an existing unclaimed keyed-latest send.
+
+        Unlike :meth:`submit_latest`, this method never creates a second pending
+        job after the prior job has been claimed. This lets a protocol owner
+        update a queued target without allowing a later request to overtake an
+        in-flight acknowledgement transaction.
+
+        Returns:
+            The replacement receipt when the keyed job was still pending, or
+            ``None`` when no replaceable job exists.
+        """
+
+        options = SendOptions(
+            endpoint_id=endpoint_id,
+            policy=SendPolicy.LATEST,
+            command_family=command_family,
+            priority=priority,
+            deadline_at_s=deadline_at_s,
+        )
+        superseded: SendReceipt
+        with self._condition:
+            if not self._accepting:
+                raise ClosedError("transmit arbiter is closed")
+            now = self._monotonic()
+            if options.deadline_at_s is not None and options.deadline_at_s <= now:
+                raise TimeoutError("send deadline has already expired")
+            latest_key = (options.endpoint_id, options.command_family)
+            previous = self._latest.get(latest_key)
+            if previous is None:
+                return None
+
+            receipt = SendReceipt(
+                generation=self._generation,
+                monotonic=self._monotonic,
+            )
+            self._next_sequence += 1
+            self._latest[latest_key] = _PendingSend(
+                message=message,
+                options=options,
+                receipt=receipt,
+                sequence=self._next_sequence,
+            )
+            superseded = previous.receipt
+            self._accepted += 1
+            self._superseded += 1
+            self._condition.notify()
+
+        if not superseded._supersede():
+            raise RuntimeError("pending latest send was claimed outside arbiter lock")
+        return receipt
+
     def submit_fifo(
         self,
         message: MessageT,

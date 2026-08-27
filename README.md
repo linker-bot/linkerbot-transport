@@ -123,6 +123,12 @@ try:
         command_family="angles",
         deadline_at_s=time.monotonic() + 0.02,
     )
+    replacement = arbiter.replace_latest_if_pending(
+        newer_angle_frame,
+        endpoint_id="left-hand",
+        command_family="angles",
+        deadline_at_s=time.monotonic() + 0.02,
+    )
     clear_fault_receipt = arbiter.submit_fifo(
         clear_fault_frame,
         endpoint_id="left-hand",
@@ -137,6 +143,10 @@ timeout. Closing or aborting the arbiter fails every pending send from the old
 connection generation; reopening never replays those messages. Arbiter health
 is a zero-I/O snapshot containing pending counts and accepted, dispatched,
 superseded, failed and capacity-rejection counters.
+
+`replace_latest_if_pending()` returns `None` once the prior keyed job has been
+claimed or no such job exists. It never queues a second job behind an in-flight
+request, which lets protocol runtimes preserve response-correlation ordering.
 
 The legacy dispatcher classes still open immediately when constructed. They
 remain available only to preserve existing SDK behavior during migration. A

@@ -161,6 +161,74 @@ def test_new_latest_does_not_supersede_claimed_send() -> None:
         arbiter.close()
 
 
+def test_replace_latest_if_pending_never_queues_behind_a_claimed_send() -> None:
+    dispatch = ControlledDispatch(blocked_message="first")
+    arbiter = TransmitArbiter[str](dispatch)
+    arbiter.open(generation=1)
+    try:
+        assert (
+            arbiter.replace_latest_if_pending(
+                "missing",
+                endpoint_id="l6",
+                command_family="angles",
+            )
+            is None
+        )
+        first = arbiter.submit_latest(
+            "first", endpoint_id="l6", command_family="angles"
+        )
+        assert dispatch.started.wait(timeout=1.0)
+        assert first.claimed_at_s is not None
+
+        replacement = arbiter.replace_latest_if_pending(
+            "must-not-queue",
+            endpoint_id="l6",
+            command_family="angles",
+        )
+
+        assert replacement is None
+        assert arbiter.get_health().pending_latest == 0
+        dispatch.release.set()
+        assert first.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert dispatch.sent == ["first"]
+    finally:
+        dispatch.release.set()
+        arbiter.close()
+
+
+def test_replace_latest_if_pending_atomically_supersedes_a_queued_job() -> None:
+    dispatch = ControlledDispatch(blocked_message="block")
+    arbiter = TransmitArbiter[str](dispatch)
+    arbiter.open(generation=7)
+    try:
+        blocker = arbiter.submit_fifo("block", endpoint_id="gate")
+        assert dispatch.started.wait(timeout=1.0)
+        old = arbiter.submit_latest("old", endpoint_id="l6", command_family="angles")
+
+        replacement = arbiter.replace_latest_if_pending(
+            "replacement",
+            endpoint_id="l6",
+            command_family="angles",
+        )
+
+        assert replacement is not None
+        result = old.result(timeout=0)
+        assert result.outcome is SendOutcome.SUPERSEDED
+        assert result.claimed_at_s is None
+        health = arbiter.get_health()
+        assert health.pending_latest == 1
+        assert health.accepted == 3
+        assert health.superseded == 1
+
+        dispatch.release.set()
+        assert blocker.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert replacement.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert dispatch.sent == ["block", "replacement"]
+    finally:
+        dispatch.release.set()
+        arbiter.close()
+
+
 def test_latest_slots_are_independent_per_command_family() -> None:
     dispatch = ControlledDispatch(blocked_message="block")
     arbiter = TransmitArbiter[str](dispatch)
