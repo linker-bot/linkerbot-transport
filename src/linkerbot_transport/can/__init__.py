@@ -1,4 +1,4 @@
-from linkerbot_transport.receipts import SendReceipt
+from linkerbot_transport.receipts import SendOutcome, SendReceipt, SendResult
 
 from .can import CANMessageDispatcher
 from .transport import CANTransport, CANTransportKey
@@ -9,5 +9,7 @@ __all__ = [
     "CANTransport",
     "CANTransportKey",
     "CanInterface",
+    "SendOutcome",
     "SendReceipt",
+    "SendResult",
 ]

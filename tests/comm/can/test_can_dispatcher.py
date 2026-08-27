@@ -9,7 +9,7 @@ import pytest
 
 from linkerbot.comm.can import CANMessageDispatcher
 from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
-from linkerbot_transport import SendReceipt
+from linkerbot_transport import SendOutcome, SendReceipt
 
 
 class FakeBus:
@@ -99,7 +99,7 @@ def test_send_uses_finite_bus_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert bus.send_event.wait(timeout=1.0)
         assert isinstance(receipt, SendReceipt)
-        assert receipt.result(timeout=1.0) is None
+        assert receipt.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
         assert bus.send_timeouts == [dispatcher.SEND_TIMEOUT_S]
         assert dispatcher.SEND_TIMEOUT_S > 0
         assert math.isfinite(dispatcher.SEND_TIMEOUT_S)

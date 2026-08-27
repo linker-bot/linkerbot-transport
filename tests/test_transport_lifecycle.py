@@ -14,7 +14,7 @@ from linkerbot_transport.canfd import (
 )
 from linkerbot_transport.contracts import MessageTransport, TransportState
 from linkerbot_transport.errors import ErrorCode, TransportError
-from linkerbot_transport.receipts import SendReceipt
+from linkerbot_transport.receipts import SendOutcome, SendReceipt
 from linkerbot_transport.testing import FakeDispatcher, FakeTransport
 
 
@@ -122,7 +122,9 @@ def test_health_tracks_send_receive_and_ages() -> None:
 
     receipt = transport.send(1)
     assert isinstance(receipt, SendReceipt)
-    assert receipt.result(timeout=0) is None
+    result = receipt.result(timeout=0)
+    assert result.outcome is SendOutcome.DISPATCHED
+    assert result.generation == 1
     clock.advance(0.25)
     transport.emit(2)
     clock.advance(0.75)
@@ -159,7 +161,7 @@ def test_send_failure_is_classified_without_fake_acknowledgement() -> None:
 def test_recover_replaces_connection_without_replaying_messages() -> None:
     transport = FakeTransport[int]()
     transport.open()
-    assert transport.send(1).result(timeout=0) is None
+    assert transport.send(1).result(timeout=0).outcome is SendOutcome.DISPATCHED
     first = transport.current_dispatcher
     first.disconnect(OSError("unplugged"))
     assert transport.get_health().state is TransportState.FAULTED

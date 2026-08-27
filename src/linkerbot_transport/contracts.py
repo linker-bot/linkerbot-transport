@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .errors import ErrorCode
-from .receipts import SendReceipt
+from .receipts import SendOutcome, SendReceipt, SendResult
 
 MessageT = TypeVar("MessageT")
 
@@ -87,7 +87,9 @@ class MessageTransport(TransportLifecycle, Protocol[MessageT]):
 
 __all__ = [
     "MessageTransport",
+    "SendOutcome",
     "SendReceipt",
+    "SendResult",
     "TransportHealth",
     "TransportLifecycle",
     "TransportState",

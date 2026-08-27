@@ -27,7 +27,7 @@ from .errors import (
 )
 from .pool import SharedTransportPool, TransportLease
 from .queue import IterableQueue
-from .receipts import SendReceipt
+from .receipts import SendOutcome, SendReceipt, SendResult
 from .relay import DataRelay
 
 __all__ = [
@@ -45,7 +45,9 @@ __all__ = [
     "MessageTransport",
     "QueueFullError",
     "SDKError",
+    "SendOutcome",
     "SendReceipt",
+    "SendResult",
     "SharedTransportPool",
     "StateError",
     "TimeoutError",

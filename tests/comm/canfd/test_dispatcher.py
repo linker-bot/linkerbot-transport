@@ -9,6 +9,7 @@ import pytest
 from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot.comm.canfd import dispatcher as dispatcher_module
 from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
+from linkerbot_transport import SendOutcome
 
 
 class FakeInterface:
@@ -114,7 +115,7 @@ def test_send_queues_message_for_fake_interface() -> None:
     try:
         receipt = dispatcher.send(message)
         assert receipt.cancel() is False
-        assert receipt.result(timeout=1.0) is None
+        assert receipt.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
         assert interface.sent == [message]
     finally:
         dispatcher.stop()

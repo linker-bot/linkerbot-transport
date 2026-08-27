@@ -25,6 +25,7 @@ import pytest
 from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
 from linkerbot.comm.canfd import ctypes_backend as backend
 from linkerbot.exceptions import CANError, ValidationError
+from linkerbot_transport import SendOutcome
 
 
 class _FakeFn:
@@ -293,7 +294,9 @@ def test_dispatcher_coalesces_queued_sends_into_batch() -> None:
         assert len(interface.batch_calls) == 1
         ids = [m.arbitration_id for m in interface.batch_calls[0]]
         assert ids == [1, 2, 3]
-        assert [receipt.result(timeout=1.0) for receipt in receipts] == [None] * 3
+        assert [receipt.result(timeout=1.0).outcome for receipt in receipts] == [
+            SendOutcome.DISPATCHED
+        ] * 3
     finally:
         dispatcher.stop()
 
@@ -324,7 +327,7 @@ def test_failed_batch_fails_every_frame_receipt() -> None:
         ]
         gate.set()
 
-        assert primer.result(timeout=1.0) is None
+        assert primer.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
         for receipt in receipts:
             with pytest.raises(CANError) as raised:
                 receipt.result(timeout=1.0)

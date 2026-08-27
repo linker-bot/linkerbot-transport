@@ -206,15 +206,23 @@ class ManagedMessageTransport(Generic[MessageT]):
 
         with self._state_lock:
             dispatcher = self._require_open_locked()
+            generation = self._generation
         try:
             dispatcher.send_now(message)
         except Exception as error:
             classified = self._record_error(error, faulted=False)
-            return SendReceipt.failed(classified)
+            return SendReceipt.failed(
+                classified,
+                generation=generation,
+                monotonic=self._monotonic,
+            )
         with self._state_lock:
             self._last_successful_tx_s = self._monotonic()
             self._consecutive_errors = 0
-        return SendReceipt.completed()
+        return SendReceipt.completed(
+            generation=generation,
+            monotonic=self._monotonic,
+        )
 
     def subscribe(self, callback: Callable[[MessageT], None]) -> None:
         """Register a callback without opening the transport."""
