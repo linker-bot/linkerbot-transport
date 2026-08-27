@@ -29,6 +29,7 @@ from .pool import SharedTransportPool, TransportLease
 from .queue import IterableQueue
 from .receipts import SendOutcome, SendReceipt, SendResult
 from .relay import DataRelay
+from .transmit import SendOptions, SendPolicy, TransmitArbiter, TransmitHealth
 
 __all__ = [
     "CANError",
@@ -45,12 +46,16 @@ __all__ = [
     "MessageTransport",
     "QueueFullError",
     "SDKError",
+    "SendOptions",
     "SendOutcome",
+    "SendPolicy",
     "SendReceipt",
     "SendResult",
     "SharedTransportPool",
     "StateError",
     "TimeoutError",
+    "TransmitArbiter",
+    "TransmitHealth",
     "TransportError",
     "TransportHealth",
     "TransportLease",

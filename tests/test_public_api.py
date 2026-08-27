@@ -18,7 +18,14 @@ from linkerbot.comm.canfd import CANFDSendReceipt as LegacyCANFDSendReceipt
 from linkerbot.exceptions import TransportError as LegacyTransportError
 from linkerbot.queue import IterableQueue as LegacyIterableQueue
 from linkerbot.relay import DataRelay as LegacyDataRelay
-from linkerbot_transport import ManagedMessageTransport, SendReceipt
+from linkerbot_transport import (
+    ManagedMessageTransport,
+    SendOptions,
+    SendOutcome,
+    SendPolicy,
+    SendReceipt,
+    TransmitArbiter,
+)
 from linkerbot_transport.can import CANMessageDispatcher
 from linkerbot_transport.canfd import (
     CANFDMessage,
@@ -48,6 +55,15 @@ def test_managed_transport_is_available_from_package_root() -> None:
 
 def test_send_receipt_is_shared_by_all_transport_namespaces() -> None:
     assert CANFDSendReceipt is SendReceipt
+    assert SendOutcome.DISPATCHED.value == "dispatched"
+
+
+def test_transmit_arbiter_contract_is_available_from_package_root() -> None:
+    options = SendOptions(endpoint_id="l6", policy=SendPolicy.FIFO)
+    arbiter = TransmitArbiter[int](lambda _: SendReceipt.completed())
+
+    assert options.endpoint_id == "l6"
+    assert not arbiter.get_health().running
 
 
 def test_base_import_does_not_require_python_can() -> None:

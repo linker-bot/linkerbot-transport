@@ -8,6 +8,10 @@ This project follows Semantic Versioning.
   `SendReceipt` contract.
 - Report classic CAN background failures, shutdown drops and queue saturation
   without describing queue admission as physical transmission.
+- Add generation-aware send outcomes and monotonic acceptance, claim and
+  completion timing to successful and superseded send results.
+- Add a lifecycle-managed shared TX arbiter with keyed latest-wins commands,
+  an independent bounded FIFO, deadlines, priority aging and endpoint fairness.
 
 ## 0.1.0 - 2026-08-26
 
