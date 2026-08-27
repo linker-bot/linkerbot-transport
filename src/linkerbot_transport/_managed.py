@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import Generic, Protocol, TypeVar
 
 from .contracts import TransportHealth, TransportState
@@ -18,6 +18,7 @@ from .errors import (
     normalize_error,
 )
 from .receipts import SendReceipt
+from .routing import ReceiveRouter, RouteSubscription
 
 MessageT = TypeVar("MessageT")
 
@@ -56,28 +57,35 @@ class ManagedMessageTransport(Generic[MessageT]):
     Args:
         dispatcher_factory: Callable that creates one dispatcher when opened.
             It receives the callback used to report fatal backend errors.
+        route_key_of: Constant-time key extraction for one received datagram.
         monotonic: Injectable monotonic clock used by health snapshots.
     """
 
     def __init__(
         self,
         dispatcher_factory: DispatcherFactory[MessageT],
+        route_key_of: Callable[[MessageT], Hashable],
         *,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not callable(dispatcher_factory):
             raise ValidationError("dispatcher_factory must be callable")
+        if not callable(route_key_of):
+            raise ValidationError("route_key_of must be callable")
         if not callable(monotonic):
             raise ValidationError("monotonic must be callable")
         self._dispatcher_factory = dispatcher_factory
         self._monotonic = monotonic
+        self._receive_router = ReceiveRouter[MessageT, Hashable](
+            route_key_of,
+            monotonic=monotonic,
+        )
         self._operation_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._state = TransportState.CLOSED
         self._dispatcher: DispatcherLike[MessageT] | None = None
         self._active_token: object | None = None
         self._receive_callback: Callable[[MessageT], None] | None = None
-        self._subscribers: list[Callable[[MessageT], None]] = []
         self._generation = 0
         self._last_successful_tx_s: float | None = None
         self._last_successful_rx_s: float | None = None
@@ -100,6 +108,8 @@ class ManagedMessageTransport(Generic[MessageT]):
                         "transport owns a failed dispatcher; call recover() or close()"
                     )
                 self._state = TransportState.OPENING
+                self._generation += 1
+                generation = self._generation
                 token = object()
                 self._active_token = token
 
@@ -107,10 +117,11 @@ class ManagedMessageTransport(Generic[MessageT]):
                 self._on_dispatcher_error(token, error)
 
             def on_message(message: MessageT) -> None:
-                self._on_message(token, message)
+                self._on_message(token, generation, message)
 
             dispatcher: DispatcherLike[MessageT] | None = None
             try:
+                self._receive_router.open(generation=generation)
                 dispatcher = self._dispatcher_factory(on_bus_error)
                 dispatcher.subscribe(on_message)
                 with self._state_lock:
@@ -119,6 +130,7 @@ class ManagedMessageTransport(Generic[MessageT]):
                             raise self._opening_error
                         raise DeviceNotReadyError("dispatcher failed while opening")
             except Exception as error:
+                self._receive_router.close()
                 if dispatcher is not None:
                     try:
                         dispatcher.stop()
@@ -141,7 +153,6 @@ class ManagedMessageTransport(Generic[MessageT]):
             with self._state_lock:
                 self._dispatcher = dispatcher
                 self._receive_callback = on_message
-                self._generation += 1
                 self._consecutive_errors = 0
                 self._opening_error = None
                 self._state = TransportState.OPEN
@@ -162,6 +173,7 @@ class ManagedMessageTransport(Generic[MessageT]):
                     return
                 self._state = TransportState.CLOSING
                 self._active_token = None
+                self._receive_router.close()
 
             if receive_callback is not None:
                 try:
@@ -224,27 +236,27 @@ class ManagedMessageTransport(Generic[MessageT]):
             monotonic=self._monotonic,
         )
 
-    def subscribe(self, callback: Callable[[MessageT], None]) -> None:
-        """Register a callback without opening the transport."""
-
-        if not callable(callback):
-            raise ValidationError("callback must be callable")
-        with self._state_lock:
-            if callback not in self._subscribers:
-                self._subscribers.append(callback)
-
-    def unsubscribe(self, callback: Callable[[MessageT], None]) -> None:
-        """Remove a callback idempotently."""
+    def subscribe_route(
+        self,
+        route_key: Hashable,
+        *,
+        queue_capacity: int | None = None,
+    ) -> RouteSubscription[MessageT, Hashable]:
+        """Open one exclusive bounded inbox on the current connection."""
 
         with self._state_lock:
-            if callback in self._subscribers:
-                self._subscribers.remove(callback)
+            self._require_open_locked()
+            return self._receive_router.subscribe(
+                route_key,
+                queue_capacity=queue_capacity,
+            )
 
     def get_health(self) -> TransportHealth:
         """Return cached health data without device I/O."""
 
         now = self._monotonic()
         with self._state_lock:
+            receive = self._receive_router.get_health()
             return TransportHealth(
                 state=self._state,
                 generation=self._generation,
@@ -257,36 +269,38 @@ class ManagedMessageTransport(Generic[MessageT]):
                 last_error_code=self._last_error_code,
                 reconnect_count=self._reconnect_count,
                 pending_tx=0,
-                subscriber_count=len(self._subscribers),
+                route_count=receive.route_count,
+                pending_rx=receive.queue_depth,
+                max_pending_rx=receive.max_queue_depth,
+                rx_frames=receive.received,
+                routed_rx_frames=receive.routed,
+                route_misses=receive.route_misses,
+                rx_overflows=receive.overflows,
+                stale_rx_frames=receive.stale_frames,
+                route_key_errors=receive.key_errors,
+                route_registration_rejections=receive.registration_rejections,
+                dropped_rx_on_close=receive.dropped_on_close,
             )
 
-    def _on_message(self, token: object, message: MessageT) -> None:
+    def _on_message(self, token: object, generation: int, message: MessageT) -> None:
         with self._state_lock:
             if (
                 token is not self._active_token
                 or self._state is not TransportState.OPEN
+                or generation != self._generation
             ):
+                self._receive_router.record_stale()
                 return
             self._last_successful_rx_s = self._monotonic()
             self._consecutive_errors = 0
-            subscribers = tuple(self._subscribers)
-        for callback in subscribers:
-            with self._state_lock:
-                if (
-                    token is not self._active_token
-                    or self._state is not TransportState.OPEN
-                ):
-                    return
-            try:
-                callback(message)
-            except Exception as error:
-                self._logger.error("transport subscriber failed: %s", error)
+            self._receive_router.route(message, generation=generation)
 
     def _on_dispatcher_error(self, token: object, error: Exception) -> None:
         with self._state_lock:
             if token is not self._active_token:
                 return
-            self._record_error(error, faulted=True)
+            classified = self._record_error(error, faulted=True)
+            self._receive_router.abort(classified)
 
     def _record_error(self, error: BaseException, *, faulted: bool) -> LinkerbotError:
         classified = normalize_error(error)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .errors import ErrorCode
 from .receipts import SendOutcome, SendReceipt, SendResult
+from .routing import RouteSubscription
 
 MessageT = TypeVar("MessageT")
 
@@ -38,7 +39,17 @@ class TransportHealth:
     last_error_code: ErrorCode | None
     reconnect_count: int
     pending_tx: int
-    subscriber_count: int
+    route_count: int
+    pending_rx: int
+    max_pending_rx: int
+    rx_frames: int
+    routed_rx_frames: int
+    route_misses: int
+    rx_overflows: int
+    stale_rx_frames: int
+    route_key_errors: int
+    route_registration_rejections: int
+    dropped_rx_on_close: int
 
     @property
     def connected(self) -> bool:
@@ -70,18 +81,19 @@ class TransportLifecycle(Protocol):
 
 @runtime_checkable
 class MessageTransport(TransportLifecycle, Protocol[MessageT]):
-    """Callback-based transport for discrete protocol messages."""
+    """Route-based transport for discrete protocol messages."""
 
     def send(self, message: MessageT) -> SendReceipt:
         """Accept one message and return its physical-send receipt."""
         ...
 
-    def subscribe(self, callback: Callable[[MessageT], None]) -> None:
-        """Register a callback for received messages."""
-        ...
-
-    def unsubscribe(self, callback: Callable[[MessageT], None]) -> None:
-        """Remove a previously registered receive callback."""
+    def subscribe_route(
+        self,
+        route_key: Hashable,
+        *,
+        queue_capacity: int | None = None,
+    ) -> RouteSubscription[MessageT, Hashable]:
+        """Open one exclusive bounded receive route."""
         ...
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from linkerbot_transport._managed import DispatcherFactory, ManagedMessageTransport
 from linkerbot_transport.errors import ValidationError
+from linkerbot_transport.routing import CANRouteKey
 
 from .dispatcher import DEFAULT_MAX_CONSECUTIVE_ERRORS, CANFDMessageDispatcher
 from .socketcan_backend import (
@@ -83,7 +84,11 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
             resolved_factory: DispatcherFactory[CANFDMessage] = create
         else:
             resolved_factory = dispatcher_factory
-        super().__init__(resolved_factory, monotonic=monotonic)
+        super().__init__(
+            resolved_factory,
+            _canfd_route_key,
+            monotonic=monotonic,
+        )
 
     @property
     def pool_key(self) -> CANFDTransportKey:
@@ -171,13 +176,21 @@ class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
             resolved_factory: DispatcherFactory[CANFDMessage] = create
         else:
             resolved_factory = dispatcher_factory
-        super().__init__(resolved_factory, monotonic=monotonic)
+        super().__init__(
+            resolved_factory,
+            _canfd_route_key,
+            monotonic=monotonic,
+        )
 
     @property
     def pool_key(self) -> SocketCANFDTransportKey:
         """Return the default key used to share this physical channel."""
 
         return self._key
+
+
+def _canfd_route_key(message: CANFDMessage) -> CANRouteKey:
+    return CANRouteKey(message.arbitration_id, message.is_extended_id)
 
 
 __all__ = [

@@ -1,4 +1,5 @@
 from linkerbot_transport.receipts import SendOutcome, SendReceipt, SendResult
+from linkerbot_transport.routing import CANRouteKey, RoutedMessage, RouteSubscription
 
 from .ctypes_backend import CanFDConfig, CANFDInterface, CanFDMsg, DevInfo
 from .dispatcher import CANFDMessageDispatcher, CANFDSendReceipt
@@ -23,12 +24,15 @@ __all__ = [
     "CANFDInterface",
     "CANFDMessage",
     "CANFDMessageDispatcher",
+    "CANRouteKey",
     "CANFDSendReceipt",
     "CANFDTransport",
     "CANFDTransportKey",
     "CanFDConfig",
     "CanFDMsg",
     "DevInfo",
+    "RouteSubscription",
+    "RoutedMessage",
     "SendOutcome",
     "SendReceipt",
     "SendResult",

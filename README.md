@@ -28,8 +28,8 @@ pip install linkerbot-transport
 New code should use the canonical namespace:
 
 ```python
-from linkerbot_transport.can import CANMessageDispatcher
-from linkerbot_transport.canfd import CANFDMessage, CANFDMessageDispatcher
+from linkerbot_transport.can import CANRouteKey, CANTransport
+from linkerbot_transport.canfd import CANFDMessage, CANFDTransport
 from linkerbot_transport.errors import TransportError
 ```
 
@@ -50,6 +50,46 @@ finally:
 Use `SharedTransportPool` when several devices share the same physical channel.
 The first lease opens the transport and the final lease closes it. Recovery
 replaces the connection and never replays messages from an earlier generation.
+
+Modern CAN and CAN FD transports receive through exact, exclusive routes rather
+than broadcast callbacks. The RX thread extracts one key and performs one hash
+lookup, then places the frame in that route's bounded inbox. For CAN, the key is
+the complete arbitration ID plus the standard/extended frame flag:
+
+```python
+import can
+
+from linkerbot_transport.can import CANRouteKey, CANTransport
+
+transport = CANTransport("can0")
+transport.open()
+route = transport.subscribe_route(
+    CANRouteKey(arbitration_id=0x28, is_extended_id=False),
+    queue_capacity=64,
+)
+try:
+    receipt = transport.send(
+        can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
+    )
+    receipt.result(timeout=0.1)
+    received = route.receive(timeout_s=0.02)
+    assert received.generation == transport.get_health().generation
+finally:
+    route.close()
+    transport.close()
+```
+
+`RoutedMessage` also contains a monotonic receive timestamp and per-generation
+sequence number. A full inbox drops the newly received frame and increments
+the route and transport overflow counters. Route misses, key errors, stale
+generation frames, queue depth and close drops are likewise cached in
+`get_health()` without device I/O.
+
+Closing, aborting or recovering a transport closes all current routes and
+wakes blocked receivers. A route belongs to exactly one connection generation:
+after `recover()`, register fresh routes before accepting device traffic. Frames
+from an earlier callback generation are counted and never delivered to the new
+route.
 
 Every message transport send returns a `SendReceipt`. Completion means the
 physical backend accepted the message, not merely that a software queue did.
@@ -101,7 +141,9 @@ superseded, failed and capacity-rejection counters.
 The legacy dispatcher classes still open immediately when constructed. They
 remain available only to preserve existing SDK behavior during migration. A
 failed CAN FD batch fails every receipt because the backend cannot identify a
-partial success safely.
+partial success safely. Their callback subscriptions retain the historical
+broadcast behavior; new device runtimes should use `CANTransport`,
+`CANFDTransport` or `SocketCANFDTransport` routes.
 
 CAN FD messages default to FrameType `0x04` (FD without bit-rate switching).
 Set `frame_type=0x0C` explicitly only for devices that support BRS. A message

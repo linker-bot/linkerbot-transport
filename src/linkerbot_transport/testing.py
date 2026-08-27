@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import Generic, TypeVar
 
 from ._managed import ManagedMessageTransport
@@ -75,7 +75,12 @@ class FakeDispatcher(Generic[MessageT]):
 class FakeTransport(ManagedMessageTransport[MessageT]):
     """Explicit-lifecycle fake implementing the public message contract."""
 
-    def __init__(self, *, monotonic: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        route_key_of: Callable[[MessageT], Hashable] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.dispatchers: list[FakeDispatcher[MessageT]] = []
 
         def create(
@@ -85,7 +90,9 @@ class FakeTransport(ManagedMessageTransport[MessageT]):
             self.dispatchers.append(dispatcher)
             return dispatcher
 
-        super().__init__(create, monotonic=monotonic)
+        if route_key_of is None:
+            route_key_of = _identity_route_key
+        super().__init__(create, route_key_of, monotonic=monotonic)
 
     @property
     def current_dispatcher(self) -> FakeDispatcher[MessageT]:
@@ -107,6 +114,12 @@ class FakeTransport(ManagedMessageTransport[MessageT]):
         """Inject one received message into the active generation."""
 
         self.current_dispatcher.emit(message)
+
+
+def _identity_route_key(message: MessageT) -> Hashable:
+    if not isinstance(message, Hashable):
+        raise TypeError("fake message is not hashable; inject route_key_of")
+    return message
 
 
 __all__ = ["FakeDispatcher", "FakeTransport"]

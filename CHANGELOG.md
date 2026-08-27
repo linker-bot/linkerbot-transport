@@ -12,6 +12,8 @@ This project follows Semantic Versioning.
   completion timing to successful and superseded send results.
 - Add a lifecycle-managed shared TX arbiter with keyed latest-wins commands,
   an independent bounded FIFO, deadlines, priority aging and endpoint fairness.
+- Add generation-safe O(1) receive routes with bounded inboxes for managed CAN,
+  CAN FD and fake transports, including miss, overflow and stale-frame health.
 
 ## 0.1.0 - 2026-08-26
 

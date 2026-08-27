@@ -10,6 +10,7 @@ import can
 
 from linkerbot_transport._managed import DispatcherFactory, ManagedMessageTransport
 from linkerbot_transport.errors import ValidationError
+from linkerbot_transport.routing import CANRouteKey
 
 from .can import DEFAULT_MAX_CONSECUTIVE_ERRORS, CANMessageDispatcher
 from .types import CanInterface
@@ -63,7 +64,11 @@ class CANTransport(ManagedMessageTransport[can.Message]):
             resolved_factory: DispatcherFactory[can.Message] = create
         else:
             resolved_factory = dispatcher_factory
-        super().__init__(resolved_factory, monotonic=monotonic)
+        super().__init__(
+            resolved_factory,
+            _can_route_key,
+            monotonic=monotonic,
+        )
 
     @property
     def can_interface(self) -> CanInterface:
@@ -76,6 +81,10 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         """Return the default key used to share this physical channel."""
 
         return self._key
+
+
+def _can_route_key(message: can.Message) -> CANRouteKey:
+    return CANRouteKey(message.arbitration_id, message.is_extended_id)
 
 
 __all__ = ["CANTransport", "CANTransportKey"]
