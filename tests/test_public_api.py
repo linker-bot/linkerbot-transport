@@ -19,7 +19,11 @@ from linkerbot.exceptions import TransportError as LegacyTransportError
 from linkerbot.queue import IterableQueue as LegacyIterableQueue
 from linkerbot.relay import DataRelay as LegacyDataRelay
 from linkerbot_transport import (
+    CANRouteKey,
     ManagedMessageTransport,
+    ReceiveRouter,
+    RoutedMessage,
+    RouteSubscription,
     SendOptions,
     SendOutcome,
     SendPolicy,
@@ -64,6 +68,18 @@ def test_transmit_arbiter_contract_is_available_from_package_root() -> None:
 
     assert options.endpoint_id == "l6"
     assert not arbiter.get_health().running
+
+
+def test_receive_routing_contract_is_available_from_package_root() -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    route = router.subscribe(7)
+
+    assert isinstance(route, RouteSubscription)
+    assert CANRouteKey(0x27, False).arbitration_id == 0x27
+    assert router.route(7, generation=1)
+    assert isinstance(route.receive(timeout_s=0), RoutedMessage)
+    router.close()
 
 
 def test_base_import_does_not_require_python_can() -> None:
