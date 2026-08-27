@@ -4,6 +4,8 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.1 - 2026-08-28
+
 - Unify classic CAN, CAN FD, managed and fake transport sends on the observable
   `SendReceipt` contract.
 - Report classic CAN background failures, shutdown drops and queue saturation
@@ -14,6 +16,8 @@ This project follows Semantic Versioning.
   an independent bounded FIFO, deadlines, priority aging and endpoint fairness.
 - Add generation-safe O(1) receive routes with bounded inboxes for managed CAN,
   CAN FD and fake transports, including miss, overflow and stale-frame health.
+- Allow one endpoint to cancel and boundedly drain only its own pending shared
+  transport work without interrupting other endpoint leases.
 
 ## 0.1.0 - 2026-08-26
 
