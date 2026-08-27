@@ -362,6 +362,101 @@ def test_close_fails_pending_and_reopen_does_not_replay_it() -> None:
         arbiter.close()
 
 
+def test_cancel_endpoint_fails_only_its_unclaimed_work() -> None:
+    dispatch = ControlledDispatch(blocked_message="block")
+    arbiter = TransmitArbiter[str](dispatch)
+    arbiter.open(generation=1)
+    try:
+        blocker = arbiter.submit_fifo("block", endpoint_id="gate")
+        assert dispatch.started.wait(timeout=1.0)
+        l6_latest = arbiter.submit_latest(
+            "l6-angle", endpoint_id="l6", command_family="angles"
+        )
+        l6_fifo = arbiter.submit_fifo("l6-clear", endpoint_id="l6")
+        o6_fifo = arbiter.submit_fifo("o6-clear", endpoint_id="o6")
+        expected = ClosedError("l6 endpoint closed")
+
+        assert arbiter.cancel_endpoint("l6", expected) == 2
+
+        with pytest.raises(ClosedError, match="l6 endpoint closed"):
+            l6_latest.result(timeout=0)
+        with pytest.raises(ClosedError, match="l6 endpoint closed"):
+            l6_fifo.result(timeout=0)
+        health = arbiter.get_health()
+        assert health.pending_latest == 0
+        assert health.pending_fifo == 1
+        assert health.failed == 2
+
+        dispatch.release.set()
+        assert blocker.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert o6_fifo.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert dispatch.sent == ["block", "o6-clear"]
+    finally:
+        dispatch.release.set()
+        arbiter.close()
+
+
+def test_cancel_endpoint_waits_for_its_claimed_send() -> None:
+    dispatch = ControlledDispatch(blocked_message="l6-angle")
+    arbiter = TransmitArbiter[str](dispatch)
+    arbiter.open(generation=1)
+    claimed = arbiter.submit_latest(
+        "l6-angle", endpoint_id="l6", command_family="angles"
+    )
+    assert dispatch.started.wait(timeout=1.0)
+    other = arbiter.submit_fifo("o6-clear", endpoint_id="o6")
+    cancelled: list[int] = []
+    cancellation_started = threading.Event()
+
+    def cancel() -> None:
+        cancellation_started.set()
+        cancelled.append(
+            arbiter.cancel_endpoint("l6", ClosedError("closed"), timeout_s=1.0)
+        )
+
+    canceller = threading.Thread(target=cancel)
+    canceller.start()
+    try:
+        assert cancellation_started.wait(timeout=1.0)
+        assert canceller.is_alive()
+        assert not other.done()
+    finally:
+        dispatch.release.set()
+    canceller.join(timeout=1.0)
+
+    try:
+        assert not canceller.is_alive()
+        assert cancelled == [0]
+        assert claimed.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert other.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+        assert dispatch.sent == ["l6-angle", "o6-clear"]
+    finally:
+        arbiter.close()
+
+
+def test_cancel_endpoint_times_out_when_claimed_send_does_not_drain() -> None:
+    dispatch = ControlledDispatch(blocked_message="l6-angle")
+    arbiter = TransmitArbiter[str](dispatch)
+    arbiter.open(generation=1)
+    claimed = arbiter.submit_fifo("l6-angle", endpoint_id="l6")
+    assert dispatch.started.wait(timeout=1.0)
+
+    try:
+        with pytest.raises(TimeoutError, match="did not drain"):
+            arbiter.cancel_endpoint(
+                "l6",
+                ClosedError("closed"),
+                timeout_s=0.01,
+            )
+    finally:
+        dispatch.release.set()
+
+    try:
+        assert claimed.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
+    finally:
+        arbiter.close()
+
+
 def test_dispatch_failure_is_classified_and_worker_continues() -> None:
     expected = OSError("write failed")
 

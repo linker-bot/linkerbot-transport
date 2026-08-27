@@ -197,6 +197,68 @@ class TransmitArbiter(Generic[MessageT]):
             raise ValidationError("error must be a BaseException")
         self._stop(normalize_error(error))
 
+    def cancel_endpoint(
+        self,
+        endpoint_id: Hashable,
+        error: BaseException,
+        *,
+        timeout_s: float | None = None,
+    ) -> int:
+        """Cancel pending work for one endpoint and drain its claimed send.
+
+        The caller must close its endpoint admission gate before calling this
+        method. Jobs that have not been claimed are failed with ``error``.
+        A job already claimed by the worker cannot be cancelled honestly, so
+        this method waits boundedly for it to finish. Work owned by every other
+        endpoint remains queued and dispatchable.
+
+        Args:
+            endpoint_id: Endpoint whose pending work must be removed.
+            error: Stable failure stored in each cancelled send receipt.
+            timeout_s: Maximum time to wait for a claimed send. Defaults to the
+                arbiter's configured worker join timeout.
+
+        Returns:
+            The number of unclaimed send receipts cancelled.
+
+        Raises:
+            TimeoutError: If this endpoint's claimed send does not finish in
+                time.
+            ValidationError: If an argument is invalid.
+        """
+
+        _validate_hashable(endpoint_id, "endpoint_id")
+        if not isinstance(error, BaseException):
+            raise ValidationError("error must be a BaseException")
+        if timeout_s is None:
+            timeout_s = self._join_timeout_s
+        else:
+            _validate_positive_float(timeout_s, "timeout_s")
+            timeout_s = float(timeout_s)
+        failure = normalize_error(error)
+
+        with self._condition:
+            pending = self._take_endpoint_pending_locked(endpoint_id)
+            self._failed += len(pending)
+            self._condition.notify_all()
+
+        for job in pending:
+            job.receipt._fail(failure)
+
+        deadline = self._monotonic() + timeout_s
+        with self._condition:
+            while (
+                self._in_flight is not None
+                and self._in_flight.options.endpoint_id == endpoint_id
+            ):
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "endpoint send did not drain before cancellation timeout"
+                    )
+                self._condition.wait(timeout=remaining)
+        return len(pending)
+
     def submit(self, message: MessageT, options: SendOptions) -> SendReceipt:
         """Accept one bounded send and return immediately with its receipt."""
 
@@ -450,6 +512,17 @@ class TransmitArbiter(Generic[MessageT]):
             pending.extend(queue)
         self._fifo.clear()
         self._fifo_size = 0
+        return tuple(pending)
+
+    def _take_endpoint_pending_locked(
+        self, endpoint_id: Hashable
+    ) -> tuple[_PendingSend[MessageT], ...]:
+        latest_keys = tuple(key for key in self._latest if key[0] == endpoint_id)
+        pending = [self._latest.pop(key) for key in latest_keys]
+        fifo = self._fifo.pop(endpoint_id, None)
+        if fifo is not None:
+            pending.extend(fifo)
+            self._fifo_size -= len(fifo)
         return tuple(pending)
 
 
