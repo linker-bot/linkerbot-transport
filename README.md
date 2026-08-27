@@ -51,12 +51,17 @@ Use `SharedTransportPool` when several devices share the same physical channel.
 The first lease opens the transport and the final lease closes it. Recovery
 replaces the connection and never replays messages from an earlier generation.
 
+Every message transport send returns a `SendReceipt`. Completion means the
+physical backend accepted the message, not merely that a software queue did.
+Use `receipt.result(timeout=...)` when the caller needs to observe success or a
+stable send exception. Classic CAN and CAN FD background queues follow the same
+contract; stopped or failed transports fail every outstanding receipt and do
+not automatically retry control frames.
+
 The legacy dispatcher classes still open immediately when constructed. They
-remain available only to preserve existing SDK behavior during migration.
-Queued CAN FD sends return a receipt; call `receipt.result(timeout=...)` when
-the caller must distinguish queue admission from physical backend success. A
-failed batch fails every receipt without retrying, because partial delivery is
-not observable and replaying control frames may be unsafe.
+remain available only to preserve existing SDK behavior during migration. A
+failed CAN FD batch fails every receipt because the backend cannot identify a
+partial success safely.
 
 CAN FD messages default to FrameType `0x04` (FD without bit-rate switching).
 Set `frame_type=0x0C` explicitly only for devices that support BRS. A message

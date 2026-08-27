@@ -8,7 +8,8 @@ import can
 import pytest
 
 from linkerbot.comm.can import CANMessageDispatcher
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
+from linkerbot_transport import SendReceipt
 
 
 class FakeBus:
@@ -94,14 +95,140 @@ def test_send_uses_finite_bus_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     bus = FakeBus()
     dispatcher = make_dispatcher(monkeypatch, bus)
     try:
-        dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
+        receipt = dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
 
         assert bus.send_event.wait(timeout=1.0)
+        assert isinstance(receipt, SendReceipt)
+        assert receipt.result(timeout=1.0) is None
         assert bus.send_timeouts == [dispatcher.SEND_TIMEOUT_S]
         assert dispatcher.SEND_TIMEOUT_S > 0
         assert math.isfinite(dispatcher.SEND_TIMEOUT_S)
     finally:
         dispatcher.stop()
+
+
+def test_send_receipt_preserves_background_sdk_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = ValidationError("invalid CAN frame")
+
+    class InvalidSendBus(FakeBus):
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            _ = message, timeout
+            raise expected
+
+    dispatcher = make_dispatcher(monkeypatch, InvalidSendBus())
+    try:
+        receipt = dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
+        with pytest.raises(ValidationError) as raised:
+            receipt.result(timeout=1.0)
+        assert raised.value is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_send_receipt_wraps_background_system_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = OSError("write failed")
+
+    class FailingSendBus(FakeBus):
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            _ = message, timeout
+            raise expected
+
+    dispatcher = make_dispatcher(monkeypatch, FailingSendBus())
+    try:
+        receipt = dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
+        with pytest.raises(CANError, match="background send failed") as raised:
+            receipt.result(timeout=1.0)
+        assert raised.value.cause is expected
+    finally:
+        dispatcher.stop()
+
+
+def test_fatal_send_failure_fails_current_and_queued_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class GatedFailingBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            _ = message, timeout
+            self.send_started.set()
+            assert self.release_send.wait(timeout=1.0)
+            raise CANError("physical send failed")
+
+    bus = GatedFailingBus()
+    dispatcher = make_dispatcher(monkeypatch, bus, max_consecutive_errors=1)
+    first = dispatcher.send(can.Message(arbitration_id=1, data=b"a"))
+    assert bus.send_started.wait(timeout=1.0)
+    second = dispatcher.send(can.Message(arbitration_id=2, data=b"b"))
+    bus.release_send.set()
+
+    try:
+        for receipt in (first, second):
+            with pytest.raises(CANError):
+                receipt.result(timeout=1.0)
+    finally:
+        dispatcher.stop()
+
+
+def test_send_queue_full_raises_stable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FullQueue:
+        def get(self, timeout: float | None = None) -> object:
+            time.sleep(min(timeout or 0.001, 0.001))
+            raise queue.Empty
+
+        def put_nowait(self, item: object) -> None:
+            _ = item
+            raise queue.Full
+
+    dispatcher = make_dispatcher(monkeypatch, FakeBus())
+    dispatcher._send_queue = FullQueue()  # ty: ignore[invalid-assignment]
+    try:
+        with pytest.raises(QueueFullError, match="send queue is full"):
+            dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
+    finally:
+        dispatcher.stop()
+
+
+def test_stop_fails_in_flight_and_queued_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+
+    class CloseReleasesSendBus(FakeBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = threading.Event()
+            self.release_send = threading.Event()
+
+        def send(self, message: can.Message, timeout: float | None = None) -> None:
+            self.send_started.set()
+            self.release_send.wait(timeout=1.0)
+            super().send(message, timeout)
+
+        def shutdown(self) -> None:
+            self.release_send.set()
+            super().shutdown()
+
+    bus = CloseReleasesSendBus()
+    dispatcher = make_dispatcher(monkeypatch, bus)
+    first = dispatcher.send(can.Message(arbitration_id=1, data=b"a"))
+    assert bus.send_started.wait(timeout=1.0)
+    second = dispatcher.send(can.Message(arbitration_id=2, data=b"b"))
+
+    dispatcher.stop()
+
+    for receipt in (first, second):
+        with pytest.raises(ClosedError, match="stopped before queued send completed"):
+            receipt.result(timeout=0)
 
 
 def test_transient_receive_error_uses_millisecond_backoff(

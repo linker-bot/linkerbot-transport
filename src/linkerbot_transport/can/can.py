@@ -4,10 +4,18 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import can
 
-from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import (
+    CANError,
+    ClosedError,
+    HandSDKError,
+    QueueFullError,
+    ValidationError,
+)
+from linkerbot_transport.receipts import SendReceipt, _ReceiptTracker
 
 from .types import CanInterface
 
@@ -15,6 +23,12 @@ DEFAULT_MAX_CONSECUTIVE_ERRORS = 10
 ERROR_BACKOFF_BASE_S = 0.005
 ERROR_BACKOFF_MAX_S = 0.05
 THREAD_JOIN_TIMEOUT_S = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedSend:
+    message: can.Message
+    receipt: SendReceipt
 
 
 class _ImmediateDispatchState:
@@ -76,9 +90,10 @@ class CANMessageDispatcher:
         self._subscribers_lock = threading.Lock()
         self._running = True
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._send_queue: queue.Queue[can.Message] = queue.Queue(
+        self._send_queue: queue.Queue[_QueuedSend] = queue.Queue(
             maxsize=self.SEND_QUEUE_SIZE
         )
+        self._receipts = _ReceiptTracker()
         self._on_bus_error = on_bus_error
         self._max_consecutive_errors = max_consecutive_errors
         self._bus_error: Exception | None = None
@@ -110,6 +125,7 @@ class CANMessageDispatcher:
             self._error_reported = True
             self._running = False
             self._bus_error = error
+        self._receipts.fail_all(_send_error(error, "CAN bus unavailable"))
         self._logger.error("CAN bus fatal error, stopping dispatcher: %s", error)
         if self._on_bus_error is not None:
             try:
@@ -187,7 +203,7 @@ class CANMessageDispatcher:
         consecutive_errors = 0
         while self._is_running():
             try:
-                msg = self._send_queue.get(timeout=0.01)
+                queued = self._send_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
             try:
@@ -196,12 +212,15 @@ class CANMessageDispatcher:
                     with self._error_lock:
                         if not self._running:
                             return
-                    self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
+                    self._bus.send(queued.message, timeout=self.SEND_TIMEOUT_S)
                 consecutive_errors = 0
+                self._receipts.succeed(queued.receipt)
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
             except Exception as error:
+                send_error = _send_error(error, "CAN background send failed")
+                self._receipts.fail(queued.receipt, send_error)
                 if not self._is_running():
                     return
                 consecutive_errors += 1
@@ -215,8 +234,8 @@ class CANMessageDispatcher:
                     self._handle_bus_error(error)
                     return
 
-    def send(self, msg: can.Message) -> None:
-        """Enqueue a CAN message for rate-limited sending.
+    def send(self, msg: can.Message) -> SendReceipt:
+        """Enqueue a CAN message and return its physical-send receipt.
 
         Args:
             msg: The CAN message to send.
@@ -224,7 +243,7 @@ class CANMessageDispatcher:
         Raises:
             CANError: If the CAN bus is unavailable due to a fatal error.
             RuntimeError: If the dispatcher has been stopped.
-            queue.Full: If the send queue is full (2000 messages).
+            QueueFullError: If the bounded send queue is full.
         """
         state: _ImmediateDispatchState | None = getattr(
             self._immediate_dispatch, "state", None
@@ -233,15 +252,27 @@ class CANMessageDispatcher:
             if state.claim_result is None:
                 state.claim_result = state.claim_dispatch()
             if not state.claim_result:
-                return
+                return SendReceipt.failed(
+                    ClosedError("send was not claimed before dispatch")
+                )
             self.send_now(msg)
             if not state.marked:
                 state.mark_dispatched()
                 state.marked = True
-            return
+            return SendReceipt.completed()
+        receipt = SendReceipt()
         with self._error_lock:
             self._raise_if_cannot_send_locked()
-            self._send_queue.put_nowait(msg)
+            self._receipts.register(receipt)
+            try:
+                self._send_queue.put_nowait(_QueuedSend(msg, receipt))
+            except queue.Full as error:
+                self._receipts.discard(receipt)
+                raise QueueFullError("CAN send queue is full", cause=error) from error
+            except BaseException:
+                self._receipts.discard(receipt)
+                raise
+        return receipt
 
     def send_now(self, msg: can.Message) -> None:
         """Send one frame synchronously and return only after backend success.
@@ -298,6 +329,9 @@ class CANMessageDispatcher:
         with self._error_lock:
             self._error_reported = True
             self._running = False
+        self._receipts.fail_all(
+            ClosedError("CAN dispatcher stopped before queued send completed")
+        )
         with self._subscribers_lock:
             self._subscribers.clear()
         current = threading.current_thread()
@@ -396,3 +430,9 @@ class CANMessageDispatcher:
 
 def _error_backoff_s(consecutive_errors: int) -> float:
     return min(ERROR_BACKOFF_BASE_S * consecutive_errors, ERROR_BACKOFF_MAX_S)
+
+
+def _send_error(error: BaseException, operation: str) -> HandSDKError:
+    if isinstance(error, HandSDKError):
+        return error
+    return CANError(f"{operation}: {error}", cause=error)

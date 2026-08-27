@@ -2,6 +2,13 @@
 
 This project follows Semantic Versioning.
 
+## Unreleased
+
+- Unify classic CAN, CAN FD, managed and fake transport sends on the observable
+  `SendReceipt` contract.
+- Report classic CAN background failures, shutdown drops and queue saturation
+  without describing queue admission as physical transmission.
+
 ## 0.1.0 - 2026-08-26
 
 - Publish the independent classic CAN, vendor CAN FD, and SocketCAN FD
