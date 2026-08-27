@@ -4,6 +4,8 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.2 - 2026-08-28
+
 - Add an atomic replace-if-pending operation for keyed latest sends so protocol
   runtimes never queue a replacement behind an already claimed transaction.
 
