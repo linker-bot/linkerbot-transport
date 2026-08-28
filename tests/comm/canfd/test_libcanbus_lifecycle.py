@@ -10,7 +10,7 @@ the lifetime of the process. These tests pin the refcount semantics:
 - A constructor failure after acquire (e.g. ``CANFD_Init`` returns non-zero)
   releases the refcount so partial initialization does not leak.
 - Garbage-collecting an unclosed interface still releases the refcount.
-- Calling ``LibCANbus_Init`` itself returning non-zero surfaces a ``CANError``
+- Calling ``LibCANbus_Init`` itself returning non-zero surfaces a ``TransportError``
   and does not bump the refcount.
 """
 
@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
-from linkerbot.comm.canfd import ctypes_backend as backend
-from linkerbot.exceptions import CANError
+from linkerbot_transport.canfd import ctypes_backend as backend
+from linkerbot_transport.errors import TransportError
 
 
 class _FakeFn:
@@ -122,7 +122,7 @@ def test_partial_init_failure_releases_lifecycle(
     lib.CANFD_Init.result = 3  # vendor init fails after we already acquired
     _patch_loader(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="CANFD_Init"):
+    with pytest.raises(TransportError, match="CANFD_Init"):
         backend.CANFDInterface()
 
     # Acquire ran (Init called), but partial-init guard must release on
@@ -156,7 +156,7 @@ def test_libcanbus_init_nonzero_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     lib.LibCANbus_Init.result = -1
     _patch_loader(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="LibCANbus_Init"):
+    with pytest.raises(TransportError, match="LibCANbus_Init"):
         backend.CANFDInterface()
 
     # Refcount must not bump on Init failure so a later acquire retries.
@@ -172,7 +172,7 @@ def test_close_failure_retains_refcount_until_retry_succeeds(
     _patch_loader(monkeypatch, lib)
     interface = backend.CANFDInterface()
 
-    with pytest.raises(CANError, match="CAN_CloseDevice"):
+    with pytest.raises(TransportError, match="CAN_CloseDevice"):
         interface.close()
 
     key = backend._library_key(lib)
@@ -199,7 +199,7 @@ def test_close_exception_retains_refcount_until_retry_succeeds(
     _patch_loader(monkeypatch, lib)
     interface = backend.CANFDInterface()
 
-    with pytest.raises(CANError, match="vendor close crashed"):
+    with pytest.raises(TransportError, match="vendor close crashed"):
         interface.close()
 
     key = backend._library_key(lib)
@@ -331,5 +331,5 @@ def test_missing_libcanbus_init_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     del lib.LibCANbus_Init  # simulate a too-old vendor library
     _patch_loader(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="missing LibCANbus_Init"):
+    with pytest.raises(TransportError, match="missing LibCANbus_Init"):
         backend.CANFDInterface()

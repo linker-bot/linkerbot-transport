@@ -14,12 +14,12 @@ from unittest import mock
 
 import pytest
 
-from linkerbot.comm.canfd import (
+from linkerbot_transport.canfd import (
     CANFDBackend,
     CANFDMessage,
-    SocketCANFDBackend,
 )
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot_transport.canfd.socketcan_backend import SocketCANFDBackend
+from linkerbot_transport.errors import TransportError, ValidationError
 
 pytestmark = [pytest.mark.canfd]
 
@@ -61,7 +61,7 @@ def _link_show_payload(
 def fake_can_bus():
     """Stub ``can.Bus`` so SocketCANFDBackend.__init__ does not open a real socket."""
     with mock.patch(
-        "linkerbot.comm.canfd.socketcan_backend.can.Bus", autospec=True
+        "linkerbot_transport.canfd.socketcan_backend.can.Bus", autospec=True
     ) as bus_cls:
         instance = mock.MagicMock()
         bus_cls.return_value = instance
@@ -71,7 +71,7 @@ def fake_can_bus():
 @pytest.fixture
 def with_ip_present():
     with mock.patch(
-        "linkerbot.comm.canfd.socketcan_backend.shutil.which",
+        "linkerbot_transport.canfd.socketcan_backend.shutil.which",
         return_value="/usr/sbin/ip",
     ):
         yield
@@ -82,7 +82,7 @@ def link_show(monkeypatch: pytest.MonkeyPatch) -> LinkShowFake:
     """Patch subprocess.run; default returns a 'link not configured' result."""
     fake_run = LinkShowFake()
     monkeypatch.setattr(
-        "linkerbot.comm.canfd.socketcan_backend.subprocess.run", fake_run
+        "linkerbot_transport.canfd.socketcan_backend.subprocess.run", fake_run
     )
     return fake_run
 
@@ -141,7 +141,7 @@ def test_matching_but_down_link_requires_bring_up(
         stdout=_link_show_payload(up=False),
     )
 
-    with pytest.raises(CANError) as exc:
+    with pytest.raises(TransportError) as exc:
         SocketCANFDBackend(channel="can0")
 
     message = str(exc.value)
@@ -176,7 +176,7 @@ def test_mismatch_raises_with_actionable_command(
         stdout=_link_show_payload(bitrate=500_000, data_bitrate=2_000_000),
     )
 
-    with pytest.raises(CANError) as exc:
+    with pytest.raises(TransportError) as exc:
         SocketCANFDBackend(channel="can0")
 
     message = str(exc.value)
@@ -196,7 +196,7 @@ def test_missing_link_command_does_not_include_down(
     device' and short-circuit the && chain."""
     link_show.show_response = _link_show_proc(returncode=1)
 
-    with pytest.raises(CANError) as exc:
+    with pytest.raises(TransportError) as exc:
         SocketCANFDBackend(channel="can0")
 
     message = str(exc.value)
@@ -212,7 +212,7 @@ def test_missing_link_without_auto_reconfigure_raises(
 ) -> None:
     link_show.show_response = _link_show_proc(returncode=1)
 
-    with pytest.raises(CANError, match="not configured"):
+    with pytest.raises(TransportError, match="not configured"):
         SocketCANFDBackend(channel="can0")
 
 
@@ -275,7 +275,7 @@ def test_auto_reconfigure_failure_surfaces_ip_error(
         returncode=2, stdout="", stderr="Operation not permitted"
     )
 
-    with pytest.raises(CANError, match="not permitted"):
+    with pytest.raises(TransportError, match="not permitted"):
         SocketCANFDBackend(channel="can0", auto_reconfigure=True)
 
 
@@ -471,9 +471,9 @@ def test_close_is_idempotent_and_blocks_further_io(
     backend.close()
     fake_can_bus.shutdown.assert_called_once()
 
-    with pytest.raises(CANError, match="closed"):
+    with pytest.raises(TransportError, match="closed"):
         backend.send(CANFDMessage(arbitration_id=0x1, data=b""))
-    with pytest.raises(CANError, match="closed"):
+    with pytest.raises(TransportError, match="closed"):
         backend.receive()
 
 
@@ -495,7 +495,7 @@ def test_close_failure_is_preserved_and_retryable(
 
 def test_missing_ip_command_raises(fake_can_bus) -> None:
     with mock.patch(
-        "linkerbot.comm.canfd.socketcan_backend.shutil.which", return_value=None
+        "linkerbot_transport.canfd.socketcan_backend.shutil.which", return_value=None
     ):
-        with pytest.raises(CANError, match="iproute2"):
+        with pytest.raises(TransportError, match="iproute2"):
             SocketCANFDBackend(channel="can0")

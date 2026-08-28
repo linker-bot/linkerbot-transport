@@ -9,10 +9,10 @@ from dataclasses import dataclass
 import can
 
 from linkerbot_transport.errors import (
-    CANError,
     ClosedError,
-    HandSDKError,
+    LinkerbotError,
     QueueFullError,
+    TransportError,
     ValidationError,
 )
 from linkerbot_transport.receipts import SendReceipt, _ReceiptTracker
@@ -241,7 +241,7 @@ class CANMessageDispatcher:
             msg: The CAN message to send.
 
         Raises:
-            CANError: If the CAN bus is unavailable due to a fatal error.
+            TransportError: If the CAN bus is unavailable due to a fatal error.
             RuntimeError: If the dispatcher has been stopped.
             QueueFullError: If the bounded send queue is full.
         """
@@ -277,19 +277,21 @@ class CANMessageDispatcher:
     def send_now(self, msg: can.Message) -> None:
         """Send one frame synchronously and return only after backend success.
 
-        The unified hand scheduler uses this path so its ``DISPATCHED`` stage
-        reflects an actual transport call rather than insertion into the legacy
-        asynchronous queue. Existing callers keep the queued ``send`` behavior.
+        The device scheduler uses this path so its ``DISPATCHED`` stage reflects
+        an actual transport call rather than insertion into the asynchronous
+        worker queue.
         """
         with self._transmit_lock:
             with self._error_lock:
                 self._raise_if_cannot_send_locked()
             try:
                 self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
-            except HandSDKError:
+            except LinkerbotError:
                 raise
             except Exception as error:
-                raise CANError(f"CAN send failed: {error}", cause=error) from error
+                raise TransportError(
+                    f"CAN send failed: {error}", cause=error
+                ) from error
 
     @contextmanager
     def immediate_dispatch(
@@ -324,7 +326,7 @@ class CANMessageDispatcher:
 
         Raises:
             RuntimeError: If a worker remains alive after the bus is shut down.
-            HandSDKError: If the backend reports a classified shutdown failure.
+            LinkerbotError: If the backend reports a classified shutdown failure.
         """
         with self._error_lock:
             self._error_reported = True
@@ -363,24 +365,24 @@ class CANMessageDispatcher:
 
     def _raise_if_cannot_send_locked(self) -> None:
         if self._bus_error is not None:
-            raise CANError(f"CAN bus unavailable: {self._bus_error}")
+            raise TransportError(f"CAN bus unavailable: {self._bus_error}")
         if not self._running:
             raise RuntimeError("Cannot send on a stopped CANMessageDispatcher")
 
-    def _shutdown_bus(self) -> HandSDKError | None:
+    def _shutdown_bus(self) -> LinkerbotError | None:
         with self._shutdown_lock:
             if self._shutdown_complete:
                 return None
             try:
                 self._bus.shutdown()
-            except HandSDKError as error:
+            except LinkerbotError as error:
                 return error
             except Exception as error:
-                return CANError(f"CAN bus shutdown failed: {error}", cause=error)
+                return TransportError(f"CAN bus shutdown failed: {error}", cause=error)
             self._shutdown_complete = True
             return None
 
-    def _shutdown_bus_after_transmit_drain(self) -> HandSDKError | None:
+    def _shutdown_bus_after_transmit_drain(self) -> LinkerbotError | None:
         transmit_idle = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
         if not transmit_idle:
             self._logger.warning(
@@ -432,7 +434,7 @@ def _error_backoff_s(consecutive_errors: int) -> float:
     return min(ERROR_BACKOFF_BASE_S * consecutive_errors, ERROR_BACKOFF_MAX_S)
 
 
-def _send_error(error: BaseException, operation: str) -> HandSDKError:
-    if isinstance(error, HandSDKError):
+def _send_error(error: BaseException, operation: str) -> LinkerbotError:
+    if isinstance(error, LinkerbotError):
         return error
-    return CANError(f"{operation}: {error}", cause=error)
+    return TransportError(f"{operation}: {error}", cause=error)

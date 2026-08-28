@@ -1,4 +1,4 @@
-"""Lifecycle owner for legacy dispatcher-backed message transports."""
+"""Lifecycle owner for worker-backed message transports."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ DispatcherFactory = Callable[[Callable[[Exception], None]], DispatcherLike[Messa
 
 
 class ManagedMessageTransport(Generic[MessageT]):
-    """Explicit lifecycle facade around an auto-starting legacy dispatcher.
+    """Explicit lifecycle facade around an internal channel worker.
 
     Construction stores only the dispatcher factory. The first ``open()``
     call creates the dispatcher and therefore owns all physical I/O and worker

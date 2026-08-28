@@ -22,10 +22,11 @@ from collections.abc import Callable
 
 import pytest
 
-from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
-from linkerbot.comm.canfd import ctypes_backend as backend
-from linkerbot.exceptions import CANError, ValidationError
 from linkerbot_transport import SendOutcome
+from linkerbot_transport.canfd import CANFDMessage
+from linkerbot_transport.canfd import ctypes_backend as backend
+from linkerbot_transport.canfd.dispatcher import CANFDMessageDispatcher
+from linkerbot_transport.errors import TransportError, ValidationError
 
 
 class _FakeFn:
@@ -158,7 +159,7 @@ def test_send_batch_short_send_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     interface, lib = _make(monkeypatch)
     lib.CANFD_Transmit.result = 2  # Vendor reports only 2 of 5 sent.
 
-    with pytest.raises(CANError, match="short send"):
+    with pytest.raises(TransportError, match="short send"):
         interface.send_batch(
             [CANFDMessage(arbitration_id=i + 1, data=b"x") for i in range(5)]
         )
@@ -184,7 +185,7 @@ def test_send_batch_after_close_raises_fast(
     interface, lib = _make(monkeypatch)
     interface.close()
     transmit_calls_before = len(lib.CANFD_Transmit.calls)
-    with pytest.raises(CANError, match="closed"):
+    with pytest.raises(TransportError, match="closed"):
         interface.send_batch(
             [
                 CANFDMessage(arbitration_id=1, data=b""),
@@ -302,7 +303,7 @@ def test_dispatcher_coalesces_queued_sends_into_batch() -> None:
 
 
 def test_failed_batch_fails_every_frame_receipt() -> None:
-    expected = CANError("batch outcome is unknown")
+    expected = TransportError("batch outcome is unknown")
 
     class _FailingBatchInterface(_BatchInterface):
         def send_batch(
@@ -329,7 +330,7 @@ def test_failed_batch_fails_every_frame_receipt() -> None:
 
         assert primer.result(timeout=1.0).outcome is SendOutcome.DISPATCHED
         for receipt in receipts:
-            with pytest.raises(CANError) as raised:
+            with pytest.raises(TransportError) as raised:
                 receipt.result(timeout=1.0)
             assert raised.value is expected
         assert [

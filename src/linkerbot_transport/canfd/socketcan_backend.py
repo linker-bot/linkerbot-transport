@@ -10,10 +10,10 @@ state rather than something it owns:
 - If ``<channel>`` is already up with matching ``bitrate`` /
   ``data_bitrate`` / ``fd``, the backend uses it as-is.
 - If ``<channel>`` is up with mismatched parameters, the backend raises
-  :class:`CANError` showing the exact ``ip link`` command needed to fix it,
+  :class:`TransportError` showing the exact ``ip link`` command needed to fix it,
   unless ``auto_reconfigure=True`` is passed.
 - If ``<channel>`` is not configured, the backend either runs ``ip link``
-  itself (``auto_reconfigure=True``) or raises :class:`CANError` with the
+  itself (``auto_reconfigure=True``) or raises :class:`TransportError` with the
   exact command for the user to run manually.
 
 ``auto_reconfigure`` defaults to ``False`` because the operations it would run
@@ -30,7 +30,7 @@ import threading
 
 import can
 
-from linkerbot_transport.errors import CANError, HandSDKError, ValidationError
+from linkerbot_transport.errors import LinkerbotError, TransportError, ValidationError
 
 from .types import (
     CANFD_DEFAULT_DATA_BAUD,
@@ -79,7 +79,7 @@ class _LinkState:
 class SocketCANFDBackend:
     """Linux SocketCAN backend in CAN FD mode.
 
-    Implements :class:`linkerbot.comm.canfd.CANFDBackend`. Construct one of
+    Implements :class:`linkerbot_transport.canfd.CANFDBackend`. Construct one of
     these and pass it to :class:`CANFDMessageDispatcher` via ``interface=`` to
     use SocketCAN instead of the vendor ctypes backend.
     """
@@ -112,7 +112,7 @@ class SocketCANFDBackend:
 
         Raises:
             ValidationError: If the channel name or bitrates are invalid.
-            CANError: If ``ip`` is missing, the link is misconfigured and
+            TransportError: If ``ip`` is missing, the link is misconfigured and
                 ``auto_reconfigure`` is False, or ``ip link`` itself fails.
         """
         if not isinstance(channel, str) or not channel:
@@ -166,12 +166,12 @@ class SocketCANFDBackend:
             timeout_ms: Maximum time to block waiting for the transmit slot.
 
         Raises:
-            CANError: If the backend is closed or python-can returns an error.
+            TransportError: If the backend is closed or python-can returns an error.
         """
         if timeout_ms < 0:
             raise ValidationError("timeout_ms must be non-negative")
         if self._closed:
-            raise CANError("SocketCAN FD backend is closed")
+            raise TransportError("SocketCAN FD backend is closed")
 
         is_fd, bitrate_switch = self._frame_flags(message)
         dlc = (
@@ -205,7 +205,7 @@ class SocketCANFDBackend:
                 timeout=timeout_ms / 1000.0,
             )
         except can.CanError as error:
-            raise CANError(f"SocketCAN FD send failed: {error}") from error
+            raise TransportError(f"SocketCAN FD send failed: {error}") from error
 
     def _frame_flags(self, message: CANFDMessage) -> tuple[bool, bool]:
         """Resolve vendor FrameType bits to python-can frame flags.
@@ -237,7 +237,7 @@ class SocketCANFDBackend:
         is empty. Returns an empty list when nothing arrives in time.
         """
         if self._closed:
-            raise CANError("SocketCAN FD backend is closed")
+            raise TransportError("SocketCAN FD backend is closed")
         if max_frames <= 0:
             raise ValidationError("max_frames must be positive")
         if timeout_ms < 0:
@@ -252,7 +252,7 @@ class SocketCANFDBackend:
         try:
             msg = self._bus.recv(timeout=timeout_ms / 1000.0)
         except can.CanError as error:
-            raise CANError(f"SocketCAN FD receive failed: {error}") from error
+            raise TransportError(f"SocketCAN FD receive failed: {error}") from error
         if msg is None:
             return result
         result.append(_to_canfd_message(msg))
@@ -263,7 +263,7 @@ class SocketCANFDBackend:
             try:
                 msg = self._bus.recv(timeout=0)
             except can.CanError as error:
-                raise CANError(f"SocketCAN FD receive failed: {error}") from error
+                raise TransportError(f"SocketCAN FD receive failed: {error}") from error
             if msg is None:
                 break
             result.append(_to_canfd_message(msg))
@@ -276,7 +276,7 @@ class SocketCANFDBackend:
         and may be in use by other processes.
 
         Raises:
-            CANError: If python-can cannot shut down the bus. The backend remains
+            TransportError: If python-can cannot shut down the bus. The backend remains
                 retryable after a failed shutdown.
         """
         with self._lock:
@@ -285,12 +285,12 @@ class SocketCANFDBackend:
             self._closed = True
             try:
                 self._bus.shutdown()
-            except HandSDKError:
+            except LinkerbotError:
                 self._closed = False
                 raise
             except Exception as error:
                 self._closed = False
-                raise CANError(
+                raise TransportError(
                     f"SocketCAN FD shutdown failed: {error}", cause=error
                 ) from error
 
@@ -303,7 +303,7 @@ class SocketCANFDBackend:
             setup_cmd = _format_setup_command(
                 self._channel, self._bitrate, self._data_bitrate, self._fd
             )
-            raise CANError(
+            raise TransportError(
                 f"SocketCAN channel {self._channel!r} is not configured. Run:\n"
                 f"  {setup_cmd}\n"
                 f"or pass auto_reconfigure=True (requires CAP_NET_ADMIN)."
@@ -319,7 +319,7 @@ class SocketCANFDBackend:
             setup_cmd = _format_setup_command(
                 self._channel, self._bitrate, self._data_bitrate, self._fd
             )
-            raise CANError(
+            raise TransportError(
                 f"SocketCAN channel {self._channel!r} is configured but down. Run:\n"
                 f"  {setup_cmd}\n"
                 f"or pass auto_reconfigure=True."
@@ -338,7 +338,7 @@ class SocketCANFDBackend:
                 self._channel, self._bitrate, self._data_bitrate, self._fd
             )
         state_name = "up" if state.up else "down"
-        raise CANError(
+        raise TransportError(
             f"SocketCAN channel {self._channel!r} is {state_name} but parameters mismatch. "
             f"Current: bitrate={state.bitrate}, data_bitrate={state.data_bitrate}, "
             f"fd={state.fd}. Wanted: bitrate={self._bitrate}, "
@@ -392,7 +392,7 @@ def _format_reconfigure_command(
 def _read_link_state(channel: str) -> _LinkState | None:
     """Return the parsed link state, or None if the link does not exist."""
     if shutil.which("ip") is None:
-        raise CANError(
+        raise TransportError(
             "'ip' command not found; SocketCAN backend requires Linux with iproute2"
         )
     proc = subprocess.run(
@@ -406,7 +406,7 @@ def _read_link_state(channel: str) -> _LinkState | None:
     try:
         data = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError as error:
-        raise CANError(
+        raise TransportError(
             f"failed to parse 'ip -d -j link show {channel}' output: {error}"
         ) from error
     if not data:
@@ -448,7 +448,7 @@ def _run_ip(args: list[str]) -> None:
     )
     if proc.returncode != 0:
         msg = proc.stderr.strip() or proc.stdout.strip() or "no output"
-        raise CANError(
+        raise TransportError(
             f"'ip {' '.join(args)}' failed (rc={proc.returncode}): {msg}. "
             "auto_reconfigure requires CAP_NET_ADMIN; run as root or grant capability."
         )

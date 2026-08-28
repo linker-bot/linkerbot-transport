@@ -6,9 +6,9 @@ from typing import Any
 
 import pytest
 
-from linkerbot.comm.canfd import CANFDConfigOptions, CANFDMessage
-from linkerbot.comm.canfd import ctypes_backend as backend
-from linkerbot.exceptions import CANError, ValidationError
+from linkerbot_transport.canfd import CANFDConfigOptions, CANFDMessage
+from linkerbot_transport.canfd import ctypes_backend as backend
+from linkerbot_transport.errors import TransportError, ValidationError
 
 
 class FakeFunction:
@@ -32,6 +32,7 @@ class FakeFunction:
 
 class FakeLibrary:
     def __init__(self) -> None:
+        self._name = "fake-libcanbus"
         self.LibCANbus_Init = FakeFunction(0)
         self.LibCANbus_Exit = FakeFunction(0)
         self.CAN_ScanDevice = FakeFunction(1)
@@ -129,7 +130,7 @@ def test_init_rejects_scan_error(monkeypatch: pytest.MonkeyPatch) -> None:
     lib = FakeLibrary()
     lib.CAN_ScanDevice.result = -1
 
-    with pytest.raises(CANError, match="CAN_ScanDevice"):
+    with pytest.raises(TransportError, match="CAN_ScanDevice"):
         make_interface(monkeypatch, lib)
 
 
@@ -137,7 +138,7 @@ def test_init_rejects_no_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     lib = FakeLibrary()
     lib.CAN_ScanDevice.result = 0
 
-    with pytest.raises(CANError, match="No CANFD adapter"):
+    with pytest.raises(TransportError, match="No CANFD adapter"):
         make_interface(monkeypatch, lib)
 
 
@@ -147,7 +148,7 @@ def test_init_rejects_device_index_out_of_range(
     lib = FakeLibrary()
 
     monkeypatch.setattr(backend, "_load_library", lambda library_path: lib)
-    with pytest.raises(CANError, match="out of range"):
+    with pytest.raises(TransportError, match="out of range"):
         backend.CANFDInterface(device_index=1)
 
 
@@ -155,7 +156,7 @@ def test_init_open_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     lib = FakeLibrary()
     lib.CAN_OpenDevice.result = 2
 
-    with pytest.raises(CANError, match="CAN_OpenDevice"):
+    with pytest.raises(TransportError, match="CAN_OpenDevice"):
         make_interface(monkeypatch, lib)
 
 
@@ -163,7 +164,7 @@ def test_init_failure_closes_device(monkeypatch: pytest.MonkeyPatch) -> None:
     lib = FakeLibrary()
     lib.CANFD_Init.result = 3
 
-    with pytest.raises(CANError, match="CANFD_Init"):
+    with pytest.raises(TransportError, match="CANFD_Init"):
         make_interface(monkeypatch, lib)
 
     assert lib.CAN_CloseDevice.calls == [(0, 0)]
@@ -212,7 +213,7 @@ def test_send_failure_raises(monkeypatch: pytest.MonkeyPatch, status: int) -> No
     lib.CANFD_Transmit.result = status
     interface = make_interface(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="CANFD_Transmit"):
+    with pytest.raises(TransportError, match="CANFD_Transmit"):
         interface.send(CANFDMessage(arbitration_id=1, data=b""))
 
 
@@ -228,7 +229,7 @@ def test_receive_negative_status_raises(monkeypatch: pytest.MonkeyPatch) -> None
     lib.CANFD_Receive.result = -1
     interface = make_interface(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="CANFD_Receive"):
+    with pytest.raises(TransportError, match="CANFD_Receive"):
         interface.receive()
 
 
@@ -239,7 +240,7 @@ def test_receive_rejects_vendor_count_above_requested_limit(
     lib.CANFD_Receive.result = 2
     interface = make_interface(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="more frames than requested"):
+    with pytest.raises(TransportError, match="more frames than requested"):
         interface.receive(max_frames=1)
 
 
@@ -333,7 +334,7 @@ def test_load_library_error_mentions_configuration(
         backend, "_library_candidates", lambda library_path: ["missing.so"]
     )
 
-    with pytest.raises(CANError, match="LINKERBOT_CANFD_LIB"):
+    with pytest.raises(TransportError, match="LINKERBOT_CANFD_LIB"):
         backend._load_library(None)
 
 
@@ -728,7 +729,7 @@ def test_concurrent_close_waiter_retries_when_vendor_close_raises(
     second_thread.join(timeout=1.0)
 
     assert len(first_errors) == 1
-    assert isinstance(first_errors[0], CANError)
+    assert isinstance(first_errors[0], TransportError)
     assert "vendor close crashed" in str(first_errors[0])
     assert second_errors == []
     assert lib.CAN_CloseDevice.calls == [(0, 0), (0, 0)]
@@ -742,7 +743,7 @@ def test_close_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     lib.CAN_CloseDevice.result = 1
     interface = make_interface(monkeypatch, lib)
 
-    with pytest.raises(CANError, match="CAN_CloseDevice"):
+    with pytest.raises(TransportError, match="CAN_CloseDevice"):
         interface.close()
 
     assert not interface._close_succeeded

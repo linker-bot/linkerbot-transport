@@ -9,8 +9,8 @@ import pytest
 from linkerbot_transport.errors import (
     ClosedError,
     DeviceNotReadyError,
+    DeviceStateError,
     QueueFullError,
-    StateError,
     ValidationError,
 )
 from linkerbot_transport.routing import CANRouteKey, ReceiveRouter
@@ -101,7 +101,7 @@ def test_registry_is_bounded_and_route_keys_are_exclusive() -> None:
     router.open(generation=1)
     first = router.subscribe("a")
 
-    with pytest.raises(StateError, match="already registered"):
+    with pytest.raises(DeviceStateError, match="already registered"):
         router.subscribe("a")
     with pytest.raises(QueueFullError, match="registry is full"):
         router.subscribe("b")
@@ -159,7 +159,7 @@ def test_route_group_registration_failure_leaves_no_partial_routes() -> None:
     router.open(generation=1)
     existing = router.subscribe("claimed")
 
-    with pytest.raises(StateError, match="already registered"):
+    with pytest.raises(DeviceStateError, match="already registered"):
         router.subscribe_routes(("free", "claimed"))
     assert router.get_health().route_count == 1
 

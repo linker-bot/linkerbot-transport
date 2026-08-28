@@ -1,4 +1,4 @@
-"""Stable error categories shared by Linkerbot SDK distributions."""
+"""Stable error categories exposed by Linkerbot transports."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class ErrorCode(str, Enum):
 
 
 class LinkerbotError(Exception):
-    """Base class for stable SDK errors that callers may map by type or code."""
+    """Base class for stable transport errors mapped by type or code."""
 
     code = ErrorCode.INTERNAL
 
@@ -87,7 +87,7 @@ class ClosedError(DeviceStateError):
 
 
 def normalize_error(error: BaseException) -> LinkerbotError:
-    """Map backend exceptions into the public, stable hierarchy."""
+    """Map backend exceptions into the public transport hierarchy."""
 
     if isinstance(error, LinkerbotError):
         return error
@@ -96,26 +96,14 @@ def normalize_error(error: BaseException) -> LinkerbotError:
     return TransportError(str(error), cause=error)
 
 
-# These exact aliases keep old and new catch sites interoperable during the
-# package split. Device packages can migrate from HandSDKError to SDKError.
-SDKError = LinkerbotError
-HandSDKError = LinkerbotError
-CANError = TransportError
-StateError = DeviceStateError
-
-
 __all__ = [
-    "CANError",
     "ClosedError",
     "DeviceFaultError",
     "DeviceNotReadyError",
     "DeviceStateError",
     "ErrorCode",
-    "HandSDKError",
     "LinkerbotError",
     "QueueFullError",
-    "SDKError",
-    "StateError",
     "TimeoutError",
     "TransportError",
     "UnsupportedOperationError",

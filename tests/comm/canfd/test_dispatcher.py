@@ -6,10 +6,16 @@ from typing import Protocol
 
 import pytest
 
-from linkerbot.comm.canfd import CANFDMessage, CANFDMessageDispatcher
-from linkerbot.comm.canfd import dispatcher as dispatcher_module
-from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
 from linkerbot_transport import SendOutcome
+from linkerbot_transport.canfd import CANFDMessage
+from linkerbot_transport.canfd import dispatcher as dispatcher_module
+from linkerbot_transport.canfd.dispatcher import CANFDMessageDispatcher
+from linkerbot_transport.errors import (
+    ClosedError,
+    QueueFullError,
+    TransportError,
+    ValidationError,
+)
 
 
 class FakeInterface:
@@ -144,7 +150,7 @@ def test_send_receipt_wraps_background_system_error() -> None:
 
     try:
         receipt = dispatcher.send(CANFDMessage(arbitration_id=1, data=b"x"))
-        with pytest.raises(CANError, match="background send failed") as raised:
+        with pytest.raises(TransportError, match="background send failed") as raised:
             receipt.result(timeout=1.0)
         assert raised.value.cause is expected
     finally:
@@ -181,7 +187,7 @@ def test_fatal_send_failure_fails_current_and_queued_receipts() -> None:
             _ = message, timeout_ms
             self.send_started.set()
             assert self.release_send.wait(timeout=1.0)
-            raise CANError("physical send failed")
+            raise TransportError("physical send failed")
 
     interface = GatedFailingInterface()
     dispatcher = CANFDMessageDispatcher(interface=interface, max_consecutive_errors=1)
@@ -193,7 +199,7 @@ def test_fatal_send_failure_fails_current_and_queued_receipts() -> None:
 
     try:
         for receipt in (first, second, third):
-            with pytest.raises(CANError):
+            with pytest.raises(TransportError):
                 receipt.result(timeout=1.0)
         wait_until(lambda: not dispatcher._running)
     finally:
@@ -260,8 +266,8 @@ def test_receive_errors_trigger_bus_error_once() -> None:
     )
 
     try:
-        interface.incoming.put(CANError("rx1"))
-        interface.incoming.put(CANError("rx2"))
+        interface.incoming.put(TransportError("rx1"))
+        interface.incoming.put(TransportError("rx2"))
         wait_until(lambda: len(errors) == 1)
         time.sleep(0.03)
         assert len(errors) == 1
@@ -271,7 +277,7 @@ def test_receive_errors_trigger_bus_error_once() -> None:
 
 def test_send_errors_trigger_bus_error_once() -> None:
     interface = FakeInterface()
-    interface.send_error = CANError("tx")
+    interface.send_error = TransportError("tx")
     errors: list[Exception] = []
     dispatcher = CANFDMessageDispatcher(
         interface=interface,
@@ -288,13 +294,13 @@ def test_send_errors_trigger_bus_error_once() -> None:
 
 def test_send_after_fatal_bus_error_raises_can_error() -> None:
     interface = FakeInterface()
-    interface.send_error = CANError("tx")
+    interface.send_error = TransportError("tx")
     dispatcher = CANFDMessageDispatcher(interface=interface, max_consecutive_errors=1)
 
     try:
         dispatcher.send(CANFDMessage(arbitration_id=1, data=b""))
         wait_until(lambda: not dispatcher._running)
-        with pytest.raises(CANError, match="CANFD bus unavailable"):
+        with pytest.raises(TransportError, match="CANFD bus unavailable"):
             dispatcher.send(CANFDMessage(arbitration_id=1, data=b""))
     finally:
         dispatcher.stop()
@@ -327,7 +333,7 @@ def test_concurrent_fatal_errors_report_only_once() -> None:
 
     def report_error(message: str) -> None:
         start.wait()
-        dispatcher._handle_bus_error(CANError(message))
+        dispatcher._handle_bus_error(TransportError(message))
 
     threads = [
         threading.Thread(target=report_error, args=(f"error-{index}",))
@@ -490,7 +496,7 @@ def test_error_backoff_recovers_within_milliseconds() -> None:
         # Inject one transient error then a real message; with old backoff the
         # message would take >100 ms to surface. New backoff should deliver
         # well under 100 ms even with one error.
-        interface.incoming.put(CANError("transient"))
+        interface.incoming.put(TransportError("transient"))
         time.sleep(0.001)
         interface.incoming.put(message)
         wait_until(lambda: received == [message], timeout_s=0.2)

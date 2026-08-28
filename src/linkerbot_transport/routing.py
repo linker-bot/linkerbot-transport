@@ -14,8 +14,8 @@ from typing import Generic, TypeVar
 from .errors import (
     ClosedError,
     DeviceNotReadyError,
+    DeviceStateError,
     QueueFullError,
-    StateError,
     TimeoutError,
     ValidationError,
     normalize_error,
@@ -297,7 +297,9 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
                     "receive router generation must increase after close"
                 )
             if self._routes:
-                raise StateError("closed receive router retained registered routes")
+                raise DeviceStateError(
+                    "closed receive router retained registered routes"
+                )
             self._generation = generation
             self._sequence = 0
             self._running = True
@@ -368,7 +370,9 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             if not self._running:
                 raise ClosedError("receive router is closed")
             if any(route_key in self._routes for route_key in route_keys):
-                raise StateError("one or more receive routes are already registered")
+                raise DeviceStateError(
+                    "one or more receive routes are already registered"
+                )
             if len(self._routes) + len(route_keys) > self._max_routes:
                 self._registration_rejections += 1
                 raise QueueFullError("receive route registry is full")
@@ -461,7 +465,7 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
     def _on_dequeue(self) -> None:
         with self._lock:
             if self._queue_depth <= 0:
-                raise StateError("receive router queue depth became inconsistent")
+                raise DeviceStateError("receive router queue depth became inconsistent")
             self._queue_depth -= 1
 
     def _stop(self, error: BaseException) -> None:

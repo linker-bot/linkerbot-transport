@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from linkerbot_transport.errors import (
-    CANError,
     ClosedError,
-    HandSDKError,
+    LinkerbotError,
     QueueFullError,
+    TransportError,
     ValidationError,
 )
 from linkerbot_transport.receipts import SendReceipt, _ReceiptTracker
@@ -62,7 +62,7 @@ class CANFDMessageDispatcher:
     SEND_QUEUE_SIZE = 2000
     # Default off: the vendor USB stack already paces transmits, and any
     # positive interval ends up sleeping the send thread. Subclasses or callers
-    # that want explicit pacing can override this class attribute. The legacy
+    # that want explicit pacing can override this class attribute. The old
     # 300 us CPU busy-wait has been removed entirely.
     SEND_INTERVAL_S = 0.0
     # Maximum frames coalesced into a single vendor call when the backend
@@ -293,8 +293,8 @@ class CANFDMessageDispatcher:
                 consecutive_errors = 0
                 for queued in batch:
                     self._receipts.succeed(queued.receipt)
-                # Optional pacing for backward compatibility; default 0 means
-                # rely entirely on the vendor USB stack. A previous version
+                # Optional pacing; default 0 means rely entirely on the vendor
+                # USB stack. A previous version
                 # spun `while time.monotonic() < deadline: pass` here which
                 # pegged one CPU core and capped throughput at ~3300 frames/s.
                 if self.SEND_INTERVAL_S > 0:
@@ -368,10 +368,12 @@ class CANFDMessageDispatcher:
                 self._raise_if_cannot_send_locked()
             try:
                 self._interface.send(message)
-            except HandSDKError:
+            except LinkerbotError:
                 raise
             except Exception as error:
-                raise CANError(f"CANFD send failed: {error}", cause=error) from error
+                raise TransportError(
+                    f"CANFD send failed: {error}", cause=error
+                ) from error
 
     @contextmanager
     def immediate_dispatch(
@@ -414,7 +416,7 @@ class CANFDMessageDispatcher:
 
         Raises:
             RuntimeError: If worker or transmit activity survives interface close.
-            HandSDKError: If the backend reports a classified close failure.
+            LinkerbotError: If the backend reports a classified close failure.
         """
         with self._error_lock:
             self._error_reported = True
@@ -452,7 +454,7 @@ class CANFDMessageDispatcher:
 
     def _raise_if_cannot_send_locked(self) -> None:
         if self._bus_error is not None:
-            raise CANError(f"CANFD bus unavailable: {self._bus_error}")
+            raise TransportError(f"CANFD bus unavailable: {self._bus_error}")
         if not self._running:
             raise RuntimeError("Cannot send on a stopped CANFDMessageDispatcher")
 
@@ -466,20 +468,22 @@ class CANFDMessageDispatcher:
                 running_threads.append(thread)
         return running_threads
 
-    def _close_interface(self) -> HandSDKError | None:
+    def _close_interface(self) -> LinkerbotError | None:
         with self._close_lock:
             if self._interface_closed:
                 return None
             try:
                 self._interface.close()
-            except HandSDKError as error:
+            except LinkerbotError as error:
                 return error
             except Exception as error:
-                return CANError(f"CANFD interface close failed: {error}", cause=error)
+                return TransportError(
+                    f"CANFD interface close failed: {error}", cause=error
+                )
             self._interface_closed = True
             return None
 
-    def _close_interface_after_transmit_drain(self) -> HandSDKError | None:
+    def _close_interface_after_transmit_drain(self) -> LinkerbotError | None:
         transmit_idle = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
         if not transmit_idle:
             self._logger.warning(
@@ -515,7 +519,7 @@ def _completed_receipt() -> CANFDSendReceipt:
     return CANFDSendReceipt.completed()
 
 
-def _send_error(error: BaseException, operation: str) -> HandSDKError:
-    if isinstance(error, HandSDKError):
+def _send_error(error: BaseException, operation: str) -> LinkerbotError:
+    if isinstance(error, LinkerbotError):
         return error
-    return CANError(f"{operation}: {error}", cause=error)
+    return TransportError(f"{operation}: {error}", cause=error)

@@ -26,7 +26,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from linkerbot_transport.errors import CANError, ValidationError
+from linkerbot_transport.errors import TransportError, ValidationError
 
 from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
 
@@ -102,7 +102,7 @@ def _library_key(lib: Any) -> str:
 def _lifecycle_acquire(lib: Any) -> str:
     """Increment refcount, calling ``LibCANbus_Init`` on first acquire.
 
-    Raises ``CANError`` if ``LibCANbus_Init`` returns non-zero on the first
+    Raises ``TransportError`` if ``LibCANbus_Init`` returns non-zero on the first
     call; the refcount is not bumped in that case so a later acquire will
     retry. Subsequent acquires for the same library skip the vendor call.
     """
@@ -112,13 +112,13 @@ def _lifecycle_acquire(lib: Any) -> str:
         if count == 0:
             init_fn = getattr(lib, "LibCANbus_Init", None)
             if init_fn is None:
-                raise CANError(
+                raise TransportError(
                     "vendor library is missing LibCANbus_Init; update libcanbus.so "
                     "to a version that exports the documented lifecycle entry points"
                 )
             status = init_fn()
             if status != CANFD_STATUS_OK:
-                raise CANError(f"LibCANbus_Init failed with status {status}")
+                raise TransportError(f"LibCANbus_Init failed with status {status}")
             _lifecycle_lib[key] = lib
         _lifecycle_refcount[key] = count + 1
         return key
@@ -335,25 +335,25 @@ class CANFDInterface:
         # to the interface, so no other lock is required here.
         count = self._lib.CAN_ScanDevice()
         if count < CANFD_SCAN_NO_DEVICE:
-            raise CANError(f"CAN_ScanDevice failed with status {count}")
+            raise TransportError(f"CAN_ScanDevice failed with status {count}")
         if count == CANFD_SCAN_NO_DEVICE:
-            raise CANError("No CANFD adapter found")
+            raise TransportError("No CANFD adapter found")
         if self._device_index >= count:
-            raise CANError(
+            raise TransportError(
                 f"CANFD device_index {self._device_index} out of range; "
                 f"found {count} adapter(s)"
             )
 
         status = self._lib.CAN_OpenDevice(self._device_index, self._channel_index)
         if status != CANFD_STATUS_OK:
-            raise CANError(f"CAN_OpenDevice failed with status {status}")
+            raise TransportError(f"CAN_OpenDevice failed with status {status}")
         try:
             config = self._build_ctypes_config()
             status = self._lib.CANFD_Init(
                 self._device_index, self._channel_index, ctypes.byref(config)
             )
             if status != CANFD_STATUS_OK:
-                raise CANError(f"CANFD_Init failed with status {status}")
+                raise TransportError(f"CANFD_Init failed with status {status}")
         except BaseException:
             try:
                 self._lib.CAN_CloseDevice(self._device_index, self._channel_index)
@@ -415,7 +415,7 @@ class CANFDInterface:
                 timeout_ms,
             )
             if sent != CANFD_TRANSMIT_FRAME_COUNT:
-                raise CANError(
+                raise TransportError(
                     "CANFD_Transmit failed: expected "
                     f"{CANFD_TRANSMIT_FRAME_COUNT} frame, got {sent}"
                 )
@@ -448,7 +448,7 @@ class CANFDInterface:
         Raises:
             ValidationError: If ``len(messages) > CANFD_TRANSMIT_MAX_BATCH``
                 or ``timeout_ms`` is negative.
-            CANError: If the interface is closed or the vendor library
+            TransportError: If the interface is closed or the vendor library
                 reports a short send (``sent != len(messages)``).
         """
         if timeout_ms < 0:
@@ -480,7 +480,7 @@ class CANFDInterface:
                 timeout_ms,
             )
             if sent != count:
-                raise CANError(
+                raise TransportError(
                     f"CANFD_Transmit batch short send: expected {count}, got {sent}"
                 )
 
@@ -521,11 +521,11 @@ class CANFDInterface:
                 timeout_ms,
             )
             if received < CANFD_STATUS_OK:
-                raise CANError(f"CANFD_Receive failed with status {received}")
+                raise TransportError(f"CANFD_Receive failed with status {received}")
             if received == CANFD_STATUS_OK:
                 return []
             if received > max_frames:
-                raise CANError(
+                raise TransportError(
                     "CANFD_Receive returned more frames than requested: "
                     f"requested {max_frames}, got {received}"
                 )
@@ -543,7 +543,7 @@ class CANFDInterface:
             info = DevInfo()
             status = self._lib.CAN_ReadDevInfo(self._device_index, ctypes.byref(info))
             if status != CANFD_STATUS_OK:
-                raise CANError(f"CAN_ReadDevInfo failed with status {status}")
+                raise TransportError(f"CAN_ReadDevInfo failed with status {status}")
             return {
                 "hw_type": _decode_c_string(info.HW_Type),
                 "hw_serial": _decode_c_string(info.HW_Ser),
@@ -593,10 +593,12 @@ class CANFDInterface:
                         self._device_index, self._channel_index
                     )
                 except Exception as error:
-                    raise CANError(f"CAN_CloseDevice failed: {error}") from error
+                    raise TransportError(f"CAN_CloseDevice failed: {error}") from error
 
                 if close_status != CANFD_STATUS_OK:
-                    raise CANError(f"CAN_CloseDevice failed with status {close_status}")
+                    raise TransportError(
+                        f"CAN_CloseDevice failed with status {close_status}"
+                    )
 
                 # Step 4: a successful vendor close commits lifecycle release.
                 if self._lifecycle_key is not None:
@@ -610,7 +612,7 @@ class CANFDInterface:
 
     def _ensure_open(self) -> None:
         if self._closed_event.is_set():
-            raise CANError("CANFD interface is closed")
+            raise TransportError("CANFD interface is closed")
 
     def _fill_frame(self, target: "CanFDMsg", message: CANFDMessage) -> None:
         """Populate ``target`` (a vendor ``CanFDMsg`` slot) for transmission.
@@ -735,7 +737,7 @@ def _load_library(library_path: str | Path | None) -> Any:
             return lib
 
     attempted = "\n".join(errors) if errors else "no candidates"
-    raise CANError(
+    raise TransportError(
         "Unable to load CANFD vendor library. The system loader is tried by default; "
         "pass library_path=... or set "
         f"{_ENV_LIBRARY_PATH} to the libcanbus.so/HCanbus.dll path if the library is "

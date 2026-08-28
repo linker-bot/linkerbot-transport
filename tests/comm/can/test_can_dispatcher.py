@@ -7,9 +7,14 @@ from typing import Any
 import can
 import pytest
 
-from linkerbot.comm.can import CANMessageDispatcher
-from linkerbot.exceptions import CANError, ClosedError, QueueFullError, ValidationError
 from linkerbot_transport import SendOutcome, SendReceipt
+from linkerbot_transport.can.can import CANMessageDispatcher
+from linkerbot_transport.errors import (
+    ClosedError,
+    QueueFullError,
+    TransportError,
+    ValidationError,
+)
 
 
 class FakeBus:
@@ -60,7 +65,7 @@ def make_dispatcher(
     bus: FakeBus,
     **kwargs: Any,
 ) -> CANMessageDispatcher:
-    monkeypatch.setattr("linkerbot.comm.can.can.can.Bus", lambda **options: bus)
+    monkeypatch.setattr("linkerbot_transport.can.can.can.Bus", lambda **options: bus)
     return CANMessageDispatcher(interface_name="vcan0", **kwargs)
 
 
@@ -80,8 +85,10 @@ def test_send_pacing_sleeps_instead_of_busy_wait(
             sleep_called.set()
         original_sleep(duration)
 
-    monkeypatch.setattr("linkerbot.comm.can.can.time.monotonic", lambda: next(clock))
-    monkeypatch.setattr("linkerbot.comm.can.can.time.sleep", record_sleep)
+    monkeypatch.setattr(
+        "linkerbot_transport.can.can.time.monotonic", lambda: next(clock)
+    )
+    monkeypatch.setattr("linkerbot_transport.can.can.time.sleep", record_sleep)
     try:
         dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
         assert bus.send_event.wait(timeout=1.0)
@@ -140,7 +147,7 @@ def test_send_receipt_wraps_background_system_error(
     dispatcher = make_dispatcher(monkeypatch, FailingSendBus())
     try:
         receipt = dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
-        with pytest.raises(CANError, match="background send failed") as raised:
+        with pytest.raises(TransportError, match="background send failed") as raised:
             receipt.result(timeout=1.0)
         assert raised.value.cause is expected
     finally:
@@ -160,7 +167,7 @@ def test_fatal_send_failure_fails_current_and_queued_receipts(
             _ = message, timeout
             self.send_started.set()
             assert self.release_send.wait(timeout=1.0)
-            raise CANError("physical send failed")
+            raise TransportError("physical send failed")
 
     bus = GatedFailingBus()
     dispatcher = make_dispatcher(monkeypatch, bus, max_consecutive_errors=1)
@@ -171,7 +178,7 @@ def test_fatal_send_failure_fails_current_and_queued_receipts(
 
     try:
         for receipt in (first, second):
-            with pytest.raises(CANError):
+            with pytest.raises(TransportError):
                 receipt.result(timeout=1.0)
     finally:
         dispatcher.stop()
@@ -201,7 +208,7 @@ def test_send_queue_full_raises_stable_error(
 def test_stop_fails_in_flight_and_queued_receipts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
 
     class CloseReleasesSendBus(FakeBus):
         def __init__(self) -> None:
@@ -235,7 +242,7 @@ def test_transient_receive_error_uses_millisecond_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bus = FakeBus()
-    bus.receive_error = CANError("transient")
+    bus.receive_error = TransportError("transient")
     sleep_durations: list[float] = []
     original_sleep = time.sleep
 
@@ -243,7 +250,7 @@ def test_transient_receive_error_uses_millisecond_backoff(
         sleep_durations.append(duration)
         original_sleep(min(duration, 0.001))
 
-    monkeypatch.setattr("linkerbot.comm.can.can.time.sleep", record_sleep)
+    monkeypatch.setattr("linkerbot_transport.can.can.time.sleep", record_sleep)
     dispatcher = make_dispatcher(monkeypatch, bus, max_consecutive_errors=2)
     try:
         deadline = time.monotonic() + 1.0
@@ -271,7 +278,7 @@ def test_invalid_error_threshold_is_rejected_before_opening_bus(
         opened = True
         return FakeBus()
 
-    monkeypatch.setattr("linkerbot.comm.can.can.can.Bus", open_bus)
+    monkeypatch.setattr("linkerbot_transport.can.can.can.Bus", open_bus)
 
     with pytest.raises(ValidationError, match="positive int"):
         CANMessageDispatcher(
@@ -312,7 +319,7 @@ class ShutdownInterruptsSendBus(FakeBus):
 def test_stop_shuts_down_bus_to_interrupt_blocked_send(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
     bus = ShutdownInterruptsSendBus()
     dispatcher = make_dispatcher(monkeypatch, bus)
     dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
@@ -328,7 +335,7 @@ def test_stop_shuts_down_bus_to_interrupt_blocked_send(
 def test_concurrent_stop_shuts_down_bus_once_and_joins_workers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
     bus = ShutdownInterruptsSendBus()
     dispatcher = make_dispatcher(monkeypatch, bus)
     dispatcher.send(can.Message(arbitration_id=1, data=b"x"))
@@ -361,7 +368,7 @@ def test_concurrent_stop_shuts_down_bus_once_and_joins_workers(
 def test_stop_reports_worker_that_ignores_bus_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
     release_send = threading.Event()
 
     class StuckSendBus(FakeBus):
@@ -432,7 +439,7 @@ def test_send_and_stop_are_atomic_at_queue_boundary(
 def test_send_now_waiting_for_transmit_lock_cannot_send_after_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.01)
     bus = FakeBus()
     dispatcher = make_dispatcher(monkeypatch, bus)
     message = can.Message(arbitration_id=1, data=b"x")
@@ -479,7 +486,7 @@ def test_send_now_waiting_for_transmit_lock_cannot_send_after_stop(
 def test_stop_waits_for_in_flight_send_now_before_bus_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("linkerbot.comm.can.can.THREAD_JOIN_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("linkerbot_transport.can.can.THREAD_JOIN_TIMEOUT_S", 0.2)
 
     class OrderedSendBus(FakeBus):
         def __init__(self) -> None:

@@ -1,7 +1,7 @@
 import pytest
 
-from linkerbot.comm.canfd import dlc_to_length, length_to_dlc
-from linkerbot.exceptions import ValidationError
+from linkerbot_transport.canfd import dlc_to_length, length_to_dlc
+from linkerbot_transport.errors import ValidationError
 
 
 @pytest.mark.parametrize(

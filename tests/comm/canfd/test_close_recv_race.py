@@ -19,9 +19,9 @@ import time
 
 import pytest
 
-from linkerbot.comm.canfd import CANFDMessage
-from linkerbot.comm.canfd import ctypes_backend as backend
-from linkerbot.exceptions import CANError
+from linkerbot_transport.canfd import CANFDMessage
+from linkerbot_transport.canfd import ctypes_backend as backend
+from linkerbot_transport.errors import TransportError
 
 
 class _FakeFn:
@@ -101,7 +101,7 @@ def test_send_is_not_blocked_by_a_running_receive(
     def call_receive() -> None:
         try:
             interface.receive(timeout_ms=2000)
-        except CANError:
+        except TransportError:
             pass
 
     recv_thread = threading.Thread(target=call_receive, daemon=True)
@@ -193,9 +193,9 @@ def test_close_fails_subsequent_calls_fast(
     interface.close()
 
     transmit_before = len(lib.CANFD_Transmit.calls)
-    with pytest.raises(CANError, match="closed"):
+    with pytest.raises(TransportError, match="closed"):
         interface.send(CANFDMessage(arbitration_id=1, data=b""))
-    with pytest.raises(CANError, match="closed"):
+    with pytest.raises(TransportError, match="closed"):
         interface.receive()
     assert len(lib.CANFD_Transmit.calls) == transmit_before
 
