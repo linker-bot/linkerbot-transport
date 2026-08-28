@@ -4,6 +4,11 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.4 - 2026-08-28
+
+- Report cumulative successful transmit frames, received frames and DLC data
+  field bytes for each physical channel across connection generations.
+
 ## 0.1.3 - 2026-08-28
 
 - Allow several exact receive routes to feed one atomic bounded subscription
