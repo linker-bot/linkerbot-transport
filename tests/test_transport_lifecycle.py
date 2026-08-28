@@ -116,7 +116,10 @@ def test_concurrent_open_creates_one_connection() -> None:
 
 def test_health_tracks_send_receive_and_ages() -> None:
     clock = FakeClock(10.0)
-    transport = FakeTransport[int](monotonic=clock)
+    transport = FakeTransport[int](
+        monotonic=clock,
+        data_size_of=lambda message: message,
+    )
     transport.open()
     route = transport.subscribe_route(2)
 
@@ -139,7 +142,10 @@ def test_health_tracks_send_receive_and_ages() -> None:
     assert health.route_count == 1
     assert health.pending_tx == 0
     assert health.pending_rx == 0
+    assert health.tx_frames == 1
+    assert health.tx_bytes == 1
     assert health.rx_frames == 1
+    assert health.rx_bytes == 2
     assert health.routed_rx_frames == 1
     assert received.message == 2
     assert received.generation == 1
@@ -147,7 +153,7 @@ def test_health_tracks_send_receive_and_ages() -> None:
 
 
 def test_send_failure_is_classified_without_fake_acknowledgement() -> None:
-    transport = FakeTransport[int]()
+    transport = FakeTransport[int](data_size_of=lambda message: message)
     transport.open()
     transport.current_dispatcher.send_error = OSError("write failed")
 
@@ -159,6 +165,8 @@ def test_send_failure_is_classified_without_fake_acknowledgement() -> None:
     assert health.state is TransportState.OPEN
     assert health.consecutive_errors == 1
     assert health.last_error_code is ErrorCode.TRANSPORT
+    assert health.tx_frames == 0
+    assert health.tx_bytes == 0
     assert transport.sent == ()
     transport.close()
 
@@ -178,6 +186,83 @@ def test_receive_overflow_and_queue_depth_are_reported_in_transport_health() -> 
     assert health.routed_rx_frames == 1
     assert health.rx_overflows == 1
     assert route.get_health().overflows == 1
+    transport.close()
+
+
+def test_can_and_canfd_health_count_dlc_data_bytes() -> None:
+    can_dispatchers: list[FakeDispatcher[can.Message]] = []
+    canfd_dispatchers: list[FakeDispatcher[CANFDMessage]] = []
+
+    def create_can(
+        on_bus_error: Callable[[Exception], None],
+    ) -> FakeDispatcher[can.Message]:
+        dispatcher = FakeDispatcher[can.Message](on_bus_error)
+        can_dispatchers.append(dispatcher)
+        return dispatcher
+
+    def create_canfd(
+        on_bus_error: Callable[[Exception], None],
+    ) -> FakeDispatcher[CANFDMessage]:
+        dispatcher = FakeDispatcher[CANFDMessage](on_bus_error)
+        canfd_dispatchers.append(dispatcher)
+        return dispatcher
+
+    classic = CANTransport("can0", dispatcher_factory=create_can)
+    flexible = CANFDTransport(dispatcher_factory=create_canfd)
+    classic.open()
+    flexible.open()
+    classic_route = classic.subscribe_route(CANRouteKey(0x28, False))
+    flexible_route = flexible.subscribe_route(CANRouteKey(0x29, True))
+
+    classic_message = can.Message(
+        arbitration_id=0x28,
+        data=[0x01],
+        dlc=4,
+        is_extended_id=False,
+    )
+    flexible_message = CANFDMessage(
+        arbitration_id=0x29,
+        data=b"\x01",
+        dlc=9,
+    )
+    classic.send(classic_message).result(timeout=0)
+    flexible.send(flexible_message).result(timeout=0)
+    can_dispatchers[0].emit(classic_message)
+    canfd_dispatchers[0].emit(flexible_message)
+
+    classic_health = classic.get_health()
+    assert classic_health.tx_frames == 1
+    assert classic_health.tx_bytes == 4
+    assert classic_health.rx_frames == 1
+    assert classic_health.rx_bytes == 4
+    flexible_health = flexible.get_health()
+    assert flexible_health.tx_frames == 1
+    assert flexible_health.tx_bytes == 12
+    assert flexible_health.rx_frames == 1
+    assert flexible_health.rx_bytes == 12
+
+    classic_route.close()
+    flexible_route.close()
+    classic.close()
+    flexible.close()
+
+
+def test_traffic_counters_accumulate_across_recovery() -> None:
+    transport = FakeTransport[bytes](data_size_of=len)
+    transport.open()
+    transport.send(b"abc").result(timeout=0)
+    transport.emit(b"first")
+
+    transport.recover()
+    transport.send(b"de").result(timeout=0)
+    transport.emit(b"second")
+
+    health = transport.get_health()
+    assert health.generation == 2
+    assert health.tx_frames == 2
+    assert health.tx_bytes == 5
+    assert health.rx_frames == 2
+    assert health.rx_bytes == 11
     transport.close()
 
 
@@ -282,7 +367,7 @@ def test_late_error_from_closed_generation_is_ignored() -> None:
 
 
 def test_late_frame_from_old_generation_is_counted_and_not_delivered() -> None:
-    transport = FakeTransport[int]()
+    transport = FakeTransport[int](data_size_of=lambda message: message)
     transport.open()
     first_dispatcher = transport.current_dispatcher
     old_callback = first_dispatcher._subscribers[0]
@@ -292,7 +377,10 @@ def test_late_frame_from_old_generation_is_counted_and_not_delivered() -> None:
     old_callback(7)
 
     assert current.try_receive() is None
-    assert transport.get_health().stale_rx_frames == 1
+    health = transport.get_health()
+    assert health.rx_frames == 1
+    assert health.rx_bytes == 7
+    assert health.stale_rx_frames == 1
     transport.close()
 
 

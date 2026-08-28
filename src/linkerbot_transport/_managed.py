@@ -21,6 +21,7 @@ from .receipts import SendReceipt
 from .routing import ReceiveRouter, RouteSubscription
 
 MessageT = TypeVar("MessageT")
+_DataSizeOf = Callable[[MessageT], int]
 
 
 class DispatcherLike(Protocol[MessageT]):
@@ -58,6 +59,8 @@ class ManagedMessageTransport(Generic[MessageT]):
         dispatcher_factory: Callable that creates one dispatcher when opened.
             It receives the callback used to report fatal backend errors.
         route_key_of: Constant-time key extraction for one received datagram.
+        data_size_of: Optional zero-I/O callback returning the datagram data
+            field length used by traffic counters.
         monotonic: Injectable monotonic clock used by health snapshots.
     """
 
@@ -66,6 +69,7 @@ class ManagedMessageTransport(Generic[MessageT]):
         dispatcher_factory: DispatcherFactory[MessageT],
         route_key_of: Callable[[MessageT], Hashable],
         *,
+        data_size_of: _DataSizeOf[MessageT] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not callable(dispatcher_factory):
@@ -74,7 +78,10 @@ class ManagedMessageTransport(Generic[MessageT]):
             raise ValidationError("route_key_of must be callable")
         if not callable(monotonic):
             raise ValidationError("monotonic must be callable")
+        if data_size_of is not None and not callable(data_size_of):
+            raise ValidationError("data_size_of must be callable")
         self._dispatcher_factory = dispatcher_factory
+        self._data_size_of = data_size_of or _zero_data_size
         self._monotonic = monotonic
         self._receive_router = ReceiveRouter[MessageT, Hashable](
             route_key_of,
@@ -89,6 +96,10 @@ class ManagedMessageTransport(Generic[MessageT]):
         self._generation = 0
         self._last_successful_tx_s: float | None = None
         self._last_successful_rx_s: float | None = None
+        self._tx_frames = 0
+        self._tx_bytes = 0
+        self._rx_bytes = 0
+        self._data_size_warning_logged = False
         self._consecutive_errors = 0
         self._last_error: str | None = None
         self._last_error_code: ErrorCode | None = None
@@ -219,6 +230,7 @@ class ManagedMessageTransport(Generic[MessageT]):
         with self._state_lock:
             dispatcher = self._require_open_locked()
             generation = self._generation
+        data_size = self._measure_data_size(message)
         try:
             dispatcher.send_now(message)
         except Exception as error:
@@ -230,6 +242,8 @@ class ManagedMessageTransport(Generic[MessageT]):
             )
         with self._state_lock:
             self._last_successful_tx_s = self._monotonic()
+            self._tx_frames += 1
+            self._tx_bytes += data_size
             self._consecutive_errors = 0
         return SendReceipt.completed(
             generation=generation,
@@ -295,10 +309,15 @@ class ManagedMessageTransport(Generic[MessageT]):
                 route_key_errors=receive.key_errors,
                 route_registration_rejections=receive.registration_rejections,
                 dropped_rx_on_close=receive.dropped_on_close,
+                tx_frames=self._tx_frames,
+                tx_bytes=self._tx_bytes,
+                rx_bytes=self._rx_bytes,
             )
 
     def _on_message(self, token: object, generation: int, message: MessageT) -> None:
+        data_size = self._measure_data_size(message)
         with self._state_lock:
+            self._rx_bytes += data_size
             if (
                 token is not self._active_token
                 or self._state is not TransportState.OPEN
@@ -309,6 +328,27 @@ class ManagedMessageTransport(Generic[MessageT]):
             self._last_successful_rx_s = self._monotonic()
             self._consecutive_errors = 0
             self._receive_router.route(message, generation=generation)
+
+    def _measure_data_size(self, message: MessageT) -> int:
+        try:
+            size = self._data_size_of(message)
+        except Exception as error:  # noqa: BLE001 - metrics must not break I/O
+            self._warn_data_size_once("message data-size measurement failed: %s", error)
+            return 0
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            self._warn_data_size_once(
+                "message data-size measurement returned invalid value: %r",
+                size,
+            )
+            return 0
+        return size
+
+    def _warn_data_size_once(self, message: str, value: object) -> None:
+        with self._state_lock:
+            if self._data_size_warning_logged:
+                return
+            self._data_size_warning_logged = True
+        self._logger.warning(message, value)
 
     def _on_dispatcher_error(self, token: object, error: Exception) -> None:
         with self._state_lock:
@@ -343,10 +383,19 @@ def _age(now: float, timestamp: float | None) -> float | None:
     return max(0.0, now - timestamp)
 
 
+def _zero_data_size(message: object) -> int:
+    del message
+    return 0
+
+
 def _raise_classified(classified: LinkerbotError, original: BaseException) -> None:
     if classified is original:
         raise classified
     raise classified from original
 
 
-__all__ = ["DispatcherFactory", "DispatcherLike", "ManagedMessageTransport"]
+__all__ = [
+    "DispatcherFactory",
+    "DispatcherLike",
+    "ManagedMessageTransport",
+]

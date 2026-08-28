@@ -26,7 +26,12 @@ class TransportState(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class TransportHealth:
-    """Immutable health snapshot for one transport instance."""
+    """Immutable health snapshot for one physical transport instance.
+
+    Traffic counters are cumulative across connection generations. Byte
+    counters measure the CAN/CAN FD data field selected by DLC; they exclude
+    arbitration, CRC, bit stuffing and inter-frame spacing.
+    """
 
     state: TransportState
     generation: int
@@ -50,6 +55,9 @@ class TransportHealth:
     route_key_errors: int
     route_registration_rejections: int
     dropped_rx_on_close: int
+    tx_frames: int = 0
+    tx_bytes: int = 0
+    rx_bytes: int = 0
 
     @property
     def connected(self) -> bool:

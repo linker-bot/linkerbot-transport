@@ -17,7 +17,7 @@ from .socketcan_backend import (
     DEFAULT_NOMINAL_BITRATE,
     SocketCANFDBackend,
 )
-from .types import CANFDConfigOptions, CANFDMessage
+from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +87,7 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
         super().__init__(
             resolved_factory,
             _canfd_route_key,
+            data_size_of=_canfd_data_size,
             monotonic=monotonic,
         )
 
@@ -179,6 +180,7 @@ class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
         super().__init__(
             resolved_factory,
             _canfd_route_key,
+            data_size_of=_canfd_data_size,
             monotonic=monotonic,
         )
 
@@ -191,6 +193,12 @@ class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
 
 def _canfd_route_key(message: CANFDMessage) -> CANRouteKey:
     return CANRouteKey(message.arbitration_id, message.is_extended_id)
+
+
+def _canfd_data_size(message: CANFDMessage) -> int:
+    if message.dlc is None:
+        return len(message.data)
+    return dlc_to_length(message.dlc)
 
 
 __all__ = [

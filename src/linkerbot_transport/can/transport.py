@@ -67,6 +67,7 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         super().__init__(
             resolved_factory,
             _can_route_key,
+            data_size_of=_can_data_size,
             monotonic=monotonic,
         )
 
@@ -85,6 +86,12 @@ class CANTransport(ManagedMessageTransport[can.Message]):
 
 def _can_route_key(message: can.Message) -> CANRouteKey:
     return CANRouteKey(message.arbitration_id, message.is_extended_id)
+
+
+def _can_data_size(message: can.Message) -> int:
+    if message.is_remote_frame or message.is_error_frame:
+        return 0
+    return message.dlc
 
 
 __all__ = ["CANTransport", "CANTransportKey"]

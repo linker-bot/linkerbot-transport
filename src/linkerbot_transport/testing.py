@@ -79,6 +79,7 @@ class FakeTransport(ManagedMessageTransport[MessageT]):
         self,
         *,
         route_key_of: Callable[[MessageT], Hashable] | None = None,
+        data_size_of: Callable[[MessageT], int] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.dispatchers: list[FakeDispatcher[MessageT]] = []
@@ -92,7 +93,12 @@ class FakeTransport(ManagedMessageTransport[MessageT]):
 
         if route_key_of is None:
             route_key_of = _identity_route_key
-        super().__init__(create, route_key_of, monotonic=monotonic)
+        super().__init__(
+            create,
+            route_key_of,
+            data_size_of=data_size_of,
+            monotonic=monotonic,
+        )
 
     @property
     def current_dispatcher(self) -> FakeDispatcher[MessageT]:
