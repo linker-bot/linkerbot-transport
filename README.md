@@ -1,5 +1,8 @@
 # linkerbot-transport
 
+[English](README.md) |
+[简体中文](https://gitea.linkerhub.work/zhuzhixiang/linkerbot-transport/src/branch/main/README_zh.md)
+
 `linkerbot-transport` owns the physical communication layer shared by Linkerbot
 device SDKs. The first release provides classic CAN, vendor CAN FD and Linux
 SocketCAN FD implementations, together with stable errors and small concurrency
@@ -23,14 +26,48 @@ concurrency primitives:
 pip install linkerbot-transport
 ```
 
-## Imports
+## Public API
 
-New code should use the canonical namespace:
+Only the `linkerbot_transport` namespace is public. Classic CAN and CAN FD
+applications construct an explicit-lifecycle transport:
 
 ```python
-from linkerbot_transport.can import CANRouteKey, CANTransport
-from linkerbot_transport.canfd import CANFDMessage, CANFDTransport
-from linkerbot_transport.errors import TransportError
+from linkerbot_transport.can import CANTransport
+from linkerbot_transport.canfd import (
+    CANFDMessage,
+    CANFDTransport,
+    SocketCANFDTransport,
+)
+```
+
+The package does not provide the historical `linkerbot.comm`,
+`linkerbot.exceptions`, `linkerbot.queue` or `linkerbot.relay` namespaces.
+Auto-starting dispatcher classes are internal channel workers rather than a
+supported user API. Device SDKs and applications must use `CANTransport`,
+`CANFDTransport` or `SocketCANFDTransport`.
+
+Stable exceptions live in `linkerbot_transport.errors`. Catch the narrowest
+category required by the caller; `LinkerbotError` is the common base when an
+integration needs one final mapping boundary:
+
+```python
+from linkerbot_transport.errors import (
+    LinkerbotError,
+    TimeoutError,
+    TransportError,
+)
+
+try:
+    result = receipt.result(timeout=0.1)
+except TimeoutError:
+    # The bounded wait expired; the receipt can still complete later.
+    ...
+except TransportError:
+    # The physical backend rejected or failed the send.
+    ...
+except LinkerbotError:
+    # Validation, lifecycle and queue errors reach this final boundary.
+    ...
 ```
 
 Modern transports have an explicit lifecycle. Construction does not open a
@@ -173,17 +210,11 @@ superseded, failed and capacity-rejection counters.
 claimed or no such job exists. It never queues a second job behind an in-flight
 request, which lets protocol runtimes preserve response-correlation ordering.
 
-The legacy dispatcher classes still open immediately when constructed. They
-remain available only to preserve existing SDK behavior during migration. A
-failed CAN FD batch fails every receipt because the backend cannot identify a
-partial success safely. Their callback subscriptions retain the historical
-broadcast behavior; new device runtimes should use `CANTransport`,
-`CANFDTransport` or `SocketCANFDTransport` routes.
+A failed CAN FD batch fails every receipt because the backend cannot identify a
+partial success safely. Device runtimes receive through exact bounded routes;
+the internal channel workers are not part of the 1.0 compatibility contract.
 
 CAN FD messages default to FrameType `0x04` (FD without bit-rate switching).
 Set `frame_type=0x0C` explicitly only for devices that support BRS. A message
 with `frame_type=None` inherits the vendor interface configuration; SocketCAN
 inherits the backend's `fd` mode and keeps BRS disabled.
-
-The historical `linkerbot.comm`, `linkerbot.exceptions`, `linkerbot.queue` and
-`linkerbot.relay` imports remain available during the compatibility period.

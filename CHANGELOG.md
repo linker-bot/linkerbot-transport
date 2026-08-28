@@ -2,7 +2,19 @@
 
 This project follows Semantic Versioning.
 
-## Unreleased
+## 1.0.0rc1 - 2026-08-28
+
+- Freeze the public API around explicit-lifecycle classic CAN, vendor CAN FD,
+  SocketCAN FD, exact receive routing, observable send receipts, shared leases
+  and bounded transmit arbitration.
+- Remove the historical `linkerbot.comm`, `linkerbot.exceptions`,
+  `linkerbot.queue` and `linkerbot.relay` compatibility namespaces.
+- Remove Hand-specific and legacy error aliases from the Transport API.
+- Make auto-starting dispatcher classes internal implementation details.
+- Remove the unused iterable queue and data relay primitives.
+- Declare Python 3.10 through 3.13 support and bound the supported
+  `python-can` dependency to the compatible 4.x series.
+- Add complete English and Simplified Chinese usage documentation.
 
 ## 0.1.4 - 2026-08-28
 
