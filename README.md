@@ -102,6 +102,14 @@ the route and transport overflow counters. Route misses, key errors, stale
 generation frames, queue depth and close drops are likewise cached in
 `get_health()` without device I/O.
 
+Transport health also reports cumulative `tx_frames`, `rx_frames`, `tx_bytes`
+and `rx_bytes` for the complete physical channel across connection
+generations. A transmit is counted only after backend success; every frame
+received from the backend is counted even if routing later misses, overflows or
+rejects an old generation. Byte counters use the CAN/CAN FD data-field length
+selected by DLC. They exclude arbitration, CRC, bit stuffing and inter-frame
+spacing, so they must not be treated as direct bus-utilization measurements.
+
 Closing, aborting or recovering a transport closes all current routes and
 wakes blocked receivers. A route belongs to exactly one connection generation:
 after `recover()`, register fresh routes before accepting device traffic. Frames
