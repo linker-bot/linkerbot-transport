@@ -16,6 +16,7 @@ from linkerbot_transport import (
     SendPolicy,
     SendReceipt,
     TransmitArbiter,
+    TransmitMode,
     canfd,
     errors,
 )
@@ -45,6 +46,7 @@ ROOT_EXPORTS = {
     "TimeoutError",
     "TransmitArbiter",
     "TransmitHealth",
+    "TransmitMode",
     "TransportError",
     "TransportHealth",
     "TransportLease",
@@ -130,7 +132,10 @@ def test_old_aliases_and_implementation_classes_are_not_public() -> None:
 
 def test_transmit_and_receive_contracts_remain_available() -> None:
     options = SendOptions(endpoint_id="l6", policy=SendPolicy.FIFO)
-    arbiter = TransmitArbiter[int](lambda _: SendReceipt.completed())
+    arbiter = TransmitArbiter[int](
+        lambda _: SendReceipt.completed(),
+        mode=TransmitMode.CALLER,
+    )
     router = ReceiveRouter[int, int](lambda message: message)
     router.open(generation=1)
     route = router.subscribe(7)

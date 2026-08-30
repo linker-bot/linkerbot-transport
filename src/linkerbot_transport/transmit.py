@@ -32,6 +32,13 @@ class SendPolicy(str, Enum):
     FIFO = "fifo"
 
 
+class TransmitMode(str, Enum):
+    """Execution owner used to drain accepted transmit work."""
+
+    WORKER = "worker"
+    CALLER = "caller"
+
+
 @dataclass(frozen=True, slots=True)
 class SendOptions:
     """Scheduling metadata independent of any device protocol."""
@@ -94,13 +101,19 @@ class _PendingSend(Generic[MessageT]):
 
 
 class TransmitArbiter(Generic[MessageT]):
-    """Own one worker that serializes a shared physical transmitter.
+    """Serialize a shared physical transmitter with bounded scheduling.
 
     Latest jobs are replaced by ``(endpoint_id, command_family)`` until the
-    worker atomically claims them. Discrete jobs retain FIFO order per endpoint
-    and share one bounded capacity. Priority and deadline ordering are combined
-    with aging and least-recently-served endpoint selection to prevent a busy
-    device from permanently starving another device.
+    dispatcher atomically claims them. Discrete jobs retain FIFO order per
+    endpoint and share one bounded capacity. Priority and deadline ordering are
+    combined with aging and least-recently-served endpoint selection to prevent
+    a busy device from permanently starving another device.
+
+    ``TransmitMode.WORKER`` preserves immediate-return submission with one
+    dedicated worker. ``TransmitMode.CALLER`` is intended for runtimes that
+    already own I/O actors: submission remains non-blocking, and one actor calls
+    :meth:`drain` to cooperatively empty the shared queue. Concurrent actors can
+    still enqueue and replace unclaimed latest work while a drain is active.
     """
 
     def __init__(
@@ -112,6 +125,7 @@ class TransmitArbiter(Generic[MessageT]):
         aging_quantum_s: float = 0.05,
         join_timeout_s: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
+        mode: TransmitMode = TransmitMode.WORKER,
     ) -> None:
         if not callable(dispatch):
             raise ValidationError("dispatch must be callable")
@@ -131,6 +145,8 @@ class TransmitArbiter(Generic[MessageT]):
         _validate_positive_float(join_timeout_s, "join_timeout_s")
         if not callable(monotonic):
             raise ValidationError("monotonic must be callable")
+        if not isinstance(mode, TransmitMode):
+            raise ValidationError("mode must be a TransmitMode")
 
         self._dispatch = dispatch
         self._latest_capacity = latest_capacity
@@ -138,12 +154,14 @@ class TransmitArbiter(Generic[MessageT]):
         self._aging_quantum_s = float(aging_quantum_s)
         self._join_timeout_s = float(join_timeout_s)
         self._monotonic = monotonic
+        self._mode = mode
         self._condition = threading.Condition(threading.RLock())
         self._latest: dict[tuple[Hashable, Hashable], _PendingSend[MessageT]] = {}
         self._fifo: dict[Hashable, deque[_PendingSend[MessageT]]] = defaultdict(deque)
         self._fifo_size = 0
         self._in_flight: _PendingSend[MessageT] | None = None
         self._worker: threading.Thread | None = None
+        self._draining_thread_id: int | None = None
         self._accepting = False
         self._generation = 0
         self._next_sequence = 0
@@ -156,7 +174,7 @@ class TransmitArbiter(Generic[MessageT]):
         self._rejected_full = 0
 
     def open(self, *, generation: int) -> None:
-        """Start the single TX worker idempotently for ``generation``."""
+        """Open one worker-backed or caller-drained generation idempotently."""
 
         _validate_generation(generation)
         with self._condition:
@@ -168,10 +186,14 @@ class TransmitArbiter(Generic[MessageT]):
                 )
             if self._worker is not None and self._worker.is_alive():
                 raise DeviceNotReadyError("transmit arbiter is still closing")
+            if self._draining_thread_id is not None:
+                raise DeviceNotReadyError("transmit arbiter is still draining")
             self._generation = generation
             self._service_sequence = 0
             self._last_served.clear()
             self._accepting = True
+            if self._mode is TransmitMode.CALLER:
+                return
             worker = threading.Thread(
                 target=self._run,
                 daemon=True,
@@ -254,7 +276,7 @@ class TransmitArbiter(Generic[MessageT]):
                 remaining = deadline - self._monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        "endpoint send did not drain before cancellation timeout"
+                        "endpoint send did not drain; transmit owner did not stop in time"
                     )
                 self._condition.wait(timeout=remaining)
         return len(pending)
@@ -313,6 +335,26 @@ class TransmitArbiter(Generic[MessageT]):
         if superseded is not None:
             superseded._supersede()
         return receipt
+
+    def drain(self) -> None:
+        """Cooperatively dispatch queued work in caller mode.
+
+        The first caller becomes the temporary drain owner. Concurrent calls
+        return immediately because that owner also observes work admitted while
+        it is active. Worker mode already has a permanent owner, so calling this
+        method there is a configuration error.
+        """
+
+        if self._mode is not TransmitMode.CALLER:
+            raise DeviceNotReadyError("drain is only available in caller mode")
+        current_thread_id = threading.get_ident()
+        with self._condition:
+            if not self._accepting:
+                raise ClosedError("transmit arbiter is closed")
+            if self._draining_thread_id is not None or not self._has_pending_locked():
+                return
+            self._draining_thread_id = current_thread_id
+        self._drain_on_caller(current_thread_id)
 
     def submit_latest(
         self,
@@ -421,8 +463,12 @@ class TransmitArbiter(Generic[MessageT]):
 
         with self._condition:
             worker = self._worker
+            running = self._accepting and (
+                self._mode is TransmitMode.CALLER
+                or (worker is not None and worker.is_alive())
+            )
             return TransmitHealth(
-                running=self._accepting and worker is not None and worker.is_alive(),
+                running=running,
                 generation=self._generation,
                 pending_latest=len(self._latest),
                 pending_fifo=self._fifo_size,
@@ -437,7 +483,12 @@ class TransmitArbiter(Generic[MessageT]):
     def _stop(self, error: BaseException) -> None:
         with self._condition:
             worker = self._worker
-            if not self._accepting and (worker is None or not worker.is_alive()):
+            draining_thread_id = self._draining_thread_id
+            if (
+                not self._accepting
+                and (worker is None or not worker.is_alive())
+                and draining_thread_id is None
+            ):
                 self._worker = None
                 return
             self._accepting = False
@@ -447,6 +498,20 @@ class TransmitArbiter(Generic[MessageT]):
 
         for job in pending:
             job.receipt._fail(error)
+
+        if self._mode is TransmitMode.CALLER:
+            if draining_thread_id == threading.get_ident():
+                return
+            deadline = self._monotonic() + self._join_timeout_s
+            with self._condition:
+                while self._draining_thread_id is not None:
+                    remaining = deadline - self._monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "transmit arbiter caller did not stop draining in time"
+                        )
+                    self._condition.wait(timeout=remaining)
+            return
 
         if worker is None or worker is threading.current_thread():
             return
@@ -493,6 +558,40 @@ class TransmitArbiter(Generic[MessageT]):
                     job.receipt._fail(failure)
                 if orphaned is not None:
                     orphaned.receipt._fail(failure)
+
+    def _drain_on_caller(self, current_thread_id: int) -> None:
+        """Drain cooperatively without adding another persistent I/O thread."""
+
+        try:
+            while True:
+                with self._condition:
+                    if not self._accepting or not self._has_pending_locked():
+                        if self._draining_thread_id == current_thread_id:
+                            self._draining_thread_id = None
+                        self._condition.notify_all()
+                        return
+                    job = self._claim_next_locked()
+                self._dispatch_claimed(job)
+        except BaseException as error:  # noqa: BLE001 - scheduler boundary cleanup
+            with self._condition:
+                self._accepting = False
+                pending = self._take_all_pending_locked()
+                orphaned = self._in_flight
+                self._in_flight = None
+                failed_count = len(pending)
+                if orphaned is not None and not orphaned.receipt.done():
+                    failed_count += 1
+                self._failed += failed_count
+                if self._draining_thread_id == current_thread_id:
+                    self._draining_thread_id = None
+                self._condition.notify_all()
+            failure = TransportError(
+                f"transmit arbiter caller failed: {error}", cause=error
+            )
+            for job in pending:
+                job.receipt._fail(failure)
+            if orphaned is not None:
+                orphaned.receipt._fail(failure)
 
     def _dispatch_claimed(self, job: _PendingSend[MessageT]) -> None:
         failure: BaseException | None = None
@@ -617,4 +716,5 @@ __all__ = [
     "SendPolicy",
     "TransmitArbiter",
     "TransmitHealth",
+    "TransmitMode",
 ]

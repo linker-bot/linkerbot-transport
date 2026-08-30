@@ -30,7 +30,13 @@ from .routing import (
     RouteHealth,
     RouteSubscription,
 )
-from .transmit import SendOptions, SendPolicy, TransmitArbiter, TransmitHealth
+from .transmit import (
+    SendOptions,
+    SendPolicy,
+    TransmitArbiter,
+    TransmitHealth,
+    TransmitMode,
+)
 
 __all__ = [
     "CANRouteKey",
@@ -56,6 +62,7 @@ __all__ = [
     "TimeoutError",
     "TransmitArbiter",
     "TransmitHealth",
+    "TransmitMode",
     "TransportError",
     "TransportHealth",
     "TransportLease",

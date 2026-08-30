@@ -14,6 +14,7 @@ from linkerbot_transport import (
     SendPolicy,
     SendReceipt,
     TransmitArbiter,
+    TransmitMode,
 )
 from linkerbot_transport.errors import (
     ClosedError,
@@ -103,6 +104,142 @@ def test_constructor_does_not_start_worker() -> None:
 
     assert _arbiter_threads() == before
     assert not arbiter.get_health().running
+
+
+def test_caller_mode_dispatches_without_starting_a_worker_thread() -> None:
+    before = _arbiter_threads()
+    dispatch_threads: list[int] = []
+
+    def dispatch(_message: str) -> SendReceipt:
+        dispatch_threads.append(threading.get_ident())
+        return SendReceipt.completed()
+
+    arbiter = TransmitArbiter[str](dispatch, mode=TransmitMode.CALLER)
+    arbiter.open(generation=3)
+    try:
+        receipt = arbiter.submit_fifo("message", endpoint_id="l6")
+        assert not receipt.done()
+        assert arbiter.get_health().pending_fifo == 1
+
+        arbiter.drain()
+
+        assert receipt.result(timeout=0).outcome is SendOutcome.DISPATCHED
+        assert dispatch_threads == [threading.get_ident()]
+        assert _arbiter_threads() == before
+        health = arbiter.get_health()
+        assert health.running
+        assert health.accepted == health.dispatched == 1
+        assert not health.in_flight
+    finally:
+        arbiter.close()
+
+
+def test_caller_mode_allows_concurrent_latest_replacement_while_draining() -> None:
+    dispatch = ControlledDispatch(blocked_message="block")
+    arbiter = TransmitArbiter[str](dispatch, mode=TransmitMode.CALLER)
+    arbiter.open(generation=1)
+    blocker_receipts: list[SendReceipt] = []
+
+    def block() -> None:
+        receipt = arbiter.submit_fifo("block", endpoint_id="gate")
+        blocker_receipts.append(receipt)
+        arbiter.drain()
+
+    drainer = threading.Thread(target=block)
+    drainer.start()
+    assert dispatch.started.wait(timeout=1.0)
+    try:
+        old = arbiter.submit_latest(
+            "old",
+            endpoint_id="l6",
+            command_family="angles",
+        )
+        latest = arbiter.submit_latest(
+            "latest",
+            endpoint_id="l6",
+            command_family="angles",
+        )
+
+        assert old.result(timeout=0).outcome is SendOutcome.SUPERSEDED
+        assert not latest.done()
+        assert arbiter.get_health().pending_latest == 1
+        dispatch.release.set()
+        drainer.join(timeout=1.0)
+
+        assert not drainer.is_alive()
+        assert blocker_receipts[0].result(timeout=0).outcome is SendOutcome.DISPATCHED
+        assert latest.result(timeout=0).outcome is SendOutcome.DISPATCHED
+        assert dispatch.sent == ["block", "latest"]
+    finally:
+        dispatch.release.set()
+        drainer.join(timeout=1.0)
+        arbiter.close()
+
+
+def test_caller_mode_close_waits_for_claimed_send_and_fails_pending() -> None:
+    dispatch = ControlledDispatch(blocked_message="claimed")
+    arbiter = TransmitArbiter[str](dispatch, mode=TransmitMode.CALLER)
+    arbiter.open(generation=1)
+    claimed_receipts: list[SendReceipt] = []
+    close_errors: list[BaseException] = []
+
+    def submit_claimed() -> None:
+        receipt = arbiter.submit_fifo("claimed", endpoint_id="l6")
+        claimed_receipts.append(receipt)
+        arbiter.drain()
+
+    def close() -> None:
+        try:
+            arbiter.close()
+        except BaseException as error:  # pragma: no cover - asserted below
+            close_errors.append(error)
+
+    drainer = threading.Thread(target=submit_claimed)
+    drainer.start()
+    assert dispatch.started.wait(timeout=1.0)
+    pending = arbiter.submit_fifo("pending", endpoint_id="o6")
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        with pytest.raises(ClosedError):
+            pending.result(timeout=1.0)
+        assert closer.is_alive()
+    finally:
+        dispatch.release.set()
+        drainer.join(timeout=1.0)
+        closer.join(timeout=1.0)
+
+    assert not drainer.is_alive()
+    assert not closer.is_alive()
+    assert close_errors == []
+    assert claimed_receipts[0].result(timeout=0).outcome is SendOutcome.DISPATCHED
+    assert dispatch.sent == ["claimed"]
+
+
+def test_unexpected_caller_failure_completes_claimed_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arbiter = TransmitArbiter[str](
+        lambda _: SendReceipt.completed(),
+        mode=TransmitMode.CALLER,
+    )
+
+    def crash_after_claim(job: object) -> None:
+        _ = job
+        raise RuntimeError("scheduler invariant failed")
+
+    monkeypatch.setattr(arbiter, "_dispatch_claimed", crash_after_claim)
+    arbiter.open(generation=1)
+    receipt = arbiter.submit_fifo("message", endpoint_id="l6")
+    arbiter.drain()
+    try:
+        with pytest.raises(TransportError, match="caller failed") as raised:
+            receipt.result(timeout=0)
+        assert isinstance(raised.value.cause, RuntimeError)
+        assert receipt.outcome is SendOutcome.FAILED
+        assert not arbiter.get_health().running
+    finally:
+        arbiter.close()
 
 
 def test_latest_replaces_only_unclaimed_job() -> None:
@@ -580,6 +717,23 @@ def test_repeated_lifecycle_does_not_leak_worker_threads() -> None:
         arbiter.close()
 
     assert _wait_until(lambda: _arbiter_threads() == before)
+
+
+def test_repeated_caller_lifecycle_does_not_create_worker_threads() -> None:
+    before = _arbiter_threads()
+    arbiter = TransmitArbiter[str](
+        lambda _: SendReceipt.completed(),
+        mode=TransmitMode.CALLER,
+    )
+
+    for generation in range(1, 101):
+        arbiter.open(generation=generation)
+        receipt = arbiter.submit_fifo("message", endpoint_id="l6")
+        arbiter.drain()
+        assert receipt.result(timeout=0).outcome is SendOutcome.DISPATCHED
+        arbiter.close()
+
+    assert _arbiter_threads() == before
 
 
 def _arbiter_threads() -> set[int | None]:
