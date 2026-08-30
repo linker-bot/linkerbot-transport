@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -23,6 +24,8 @@ from .errors import (
 
 MessageT = TypeVar("MessageT")
 RouteKeyT = TypeVar("RouteKeyT", bound=Hashable)
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,7 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
         capacity: int,
         router_lock: threading.RLock,
         on_dequeue: Callable[[], None],
+        on_available: Callable[[], None] | None,
     ) -> None:
         self.route_keys = route_keys
         self.generation = generation
@@ -111,6 +115,10 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
         self._on_dequeue = on_dequeue
         self._items: deque[RoutedMessage[MessageT, RouteKeyT]] = deque()
         self._condition = threading.Condition(router_lock)
+        self._on_available = on_available
+        self._notification_lock = threading.RLock()
+        self._notifying = False
+        self._terminal_notification_pending = False
         self._active = True
         self._close_error: BaseException = ClosedError("receive route is closed")
         self._delivered = 0
@@ -123,17 +131,20 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
 
         return self.route_keys[0]
 
-    def offer(self, message: RoutedMessage[MessageT, RouteKeyT]) -> _OfferResult:
+    def offer(
+        self, message: RoutedMessage[MessageT, RouteKeyT]
+    ) -> tuple[_OfferResult, bool]:
         with self._condition:
             if not self._active:
-                return _OfferResult.CLOSED
+                return _OfferResult.CLOSED, False
             if len(self._items) >= self.capacity:
                 self._overflows += 1
-                return _OfferResult.FULL
+                return _OfferResult.FULL, False
+            was_empty = not self._items
             self._items.append(message)
             self._delivered += 1
             self._condition.notify()
-            return _OfferResult.ACCEPTED
+            return _OfferResult.ACCEPTED, was_empty
 
     def receive(self, timeout_s: float | None) -> RoutedMessage[MessageT, RouteKeyT]:
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
@@ -149,17 +160,57 @@ class _RouteState(Generic[MessageT, RouteKeyT]):
             self._on_dequeue()
             return message
 
-    def close(self, error: BaseException) -> int:
+    def close(self, error: BaseException) -> tuple[int, bool]:
         with self._condition:
             if not self._active:
-                return 0
+                return 0, False
             self._active = False
             self._close_error = error
             dropped = len(self._items)
             self._items.clear()
             self._dropped_on_close += dropped
             self._condition.notify_all()
-            return dropped
+            return dropped, True
+
+    def notify_available(self) -> None:
+        """Run the edge-triggered notifier outside the receive-router lock."""
+
+        with self._notification_lock:
+            with self._condition:
+                if not self._active:
+                    return
+            self._invoke_notification_locked()
+            self._flush_terminal_notification_locked()
+
+    def notify_closed(self) -> None:
+        """Wake a consumer once when this route reaches a terminal state."""
+
+        with self._notification_lock:
+            if self._notifying:
+                self._terminal_notification_pending = True
+                return
+            self._invoke_notification_locked()
+
+    def _flush_terminal_notification_locked(self) -> None:
+        if not self._terminal_notification_pending:
+            return
+        self._terminal_notification_pending = False
+        self._invoke_notification_locked()
+
+    def _invoke_notification_locked(self) -> None:
+        callback = self._on_available
+        if callback is None:
+            return
+        self._notifying = True
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - notifier cannot terminate transport RX
+            self._on_available = None
+            _LOGGER.exception(
+                "receive-route availability notifier failed; disabling it"
+            )
+        finally:
+            self._notifying = False
 
     def get_health(self) -> RouteHealth[RouteKeyT]:
         with self._condition:
@@ -186,7 +237,7 @@ class RouteSubscription(Generic[MessageT, RouteKeyT]):
     ) -> None:
         self._router = router
         self._state = state
-        self._close_lock = threading.Lock()
+        self._close_lock = threading.RLock()
         self._closed = False
 
     @property
@@ -234,8 +285,8 @@ class RouteSubscription(Generic[MessageT, RouteKeyT]):
         with self._close_lock:
             if self._closed:
                 return
-            self._router._unregister(self._state)
             self._closed = True
+            self._router._unregister(self._state)
 
     def __enter__(self) -> RouteSubscription[MessageT, RouteKeyT]:
         return self
@@ -328,17 +379,23 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
         route_key: RouteKeyT,
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, RouteKeyT]:
         """Register one exclusive bounded inbox for ``route_key``."""
 
         _validate_hashable(route_key, "route_key")
-        return self._subscribe((route_key,), queue_capacity=queue_capacity)
+        return self._subscribe(
+            (route_key,),
+            queue_capacity=queue_capacity,
+            on_available=on_available,
+        )
 
     def subscribe_routes(
         self,
         route_keys: Iterable[RouteKeyT],
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, RouteKeyT]:
         """Atomically route several exact keys into one bounded inbox.
 
@@ -354,18 +411,25 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             _validate_hashable(route_key, "route_keys item")
         if len(set(keys)) != len(keys):
             raise ValidationError("route_keys must not contain duplicates")
-        return self._subscribe(keys, queue_capacity=queue_capacity)
+        return self._subscribe(
+            keys,
+            queue_capacity=queue_capacity,
+            on_available=on_available,
+        )
 
     def _subscribe(
         self,
         route_keys: tuple[RouteKeyT, ...],
         *,
         queue_capacity: int | None,
+        on_available: Callable[[], None] | None,
     ) -> RouteSubscription[MessageT, RouteKeyT]:
         capacity = self._default_queue_capacity
         if queue_capacity is not None:
             _validate_positive_int(queue_capacity, "queue_capacity")
             capacity = queue_capacity
+        if on_available is not None and not callable(on_available):
+            raise ValidationError("on_available must be callable")
         with self._lock:
             if not self._running:
                 raise ClosedError("receive router is closed")
@@ -382,6 +446,7 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
                 capacity,
                 self._lock,
                 self._on_dequeue,
+                on_available,
             )
             for route_key in route_keys:
                 self._routes[route_key] = state
@@ -391,6 +456,8 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
         """Route one frame without scanning registered endpoints."""
 
         _validate_generation(generation)
+        notify_state: _RouteState[MessageT, RouteKeyT] | None = None
+        accepted = False
         with self._lock:
             self._received += 1
             if not self._running or generation != self._generation:
@@ -421,17 +488,21 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
                 sequence=self._sequence,
                 received_at_s=self._monotonic(),
             )
-            result = state.offer(routed)
+            result, became_available = state.offer(routed)
             if result is _OfferResult.ACCEPTED:
                 self._routed += 1
                 self._queue_depth += 1
                 self._max_queue_depth = max(self._max_queue_depth, self._queue_depth)
-                return True
-            if result is _OfferResult.FULL:
+                accepted = True
+                if became_available:
+                    notify_state = state
+            elif result is _OfferResult.FULL:
                 self._overflows += 1
             else:
                 self._route_misses += 1
-            return False
+        if notify_state is not None:
+            notify_state.notify_available()
+        return accepted
 
     def get_health(self) -> ReceiveRouterHealth:
         """Return aggregate counters without calling the transport backend."""
@@ -454,13 +525,16 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             )
 
     def _unregister(self, state: _RouteState[MessageT, RouteKeyT]) -> None:
+        notify_closed = False
         with self._lock:
             for route_key in state.route_keys:
                 if self._routes.get(route_key) is state:
                     del self._routes[route_key]
-            dropped = state.close(ClosedError("receive route is closed"))
+            dropped, notify_closed = state.close(ClosedError("receive route is closed"))
             self._queue_depth -= dropped
             self._dropped_on_close += dropped
+        if notify_closed:
+            state.notify_closed()
 
     def _on_dequeue(self) -> None:
         with self._lock:
@@ -469,6 +543,7 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             self._queue_depth -= 1
 
     def _stop(self, error: BaseException) -> None:
+        closed_states: list[_RouteState[MessageT, RouteKeyT]] = []
         with self._lock:
             if not self._running and not self._routes:
                 return
@@ -476,9 +551,13 @@ class ReceiveRouter(Generic[MessageT, RouteKeyT]):
             states = tuple(dict.fromkeys(self._routes.values()))
             self._routes.clear()
             for state in states:
-                dropped = state.close(error)
+                dropped, notify_closed = state.close(error)
                 self._queue_depth -= dropped
                 self._dropped_on_close += dropped
+                if notify_closed:
+                    closed_states.append(state)
+        for state in closed_states:
+            state.notify_closed()
 
 
 def _validate_hashable(value: Hashable, name: str) -> None:

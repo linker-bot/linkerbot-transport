@@ -255,6 +255,7 @@ class ManagedMessageTransport(Generic[MessageT]):
         route_key: Hashable,
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, Hashable]:
         """Open one exclusive bounded inbox on the current connection."""
 
@@ -263,6 +264,7 @@ class ManagedMessageTransport(Generic[MessageT]):
             return self._receive_router.subscribe(
                 route_key,
                 queue_capacity=queue_capacity,
+                on_available=on_available,
             )
 
     def subscribe_routes(
@@ -270,6 +272,7 @@ class ManagedMessageTransport(Generic[MessageT]):
         route_keys: Iterable[Hashable],
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, Hashable]:
         """Open one shared bounded inbox for several exact receive routes."""
 
@@ -278,6 +281,7 @@ class ManagedMessageTransport(Generic[MessageT]):
             return self._receive_router.subscribe_routes(
                 route_keys,
                 queue_capacity=queue_capacity,
+                on_available=on_available,
             )
 
     def get_health(self) -> TransportHealth:
@@ -318,16 +322,18 @@ class ManagedMessageTransport(Generic[MessageT]):
         data_size = self._measure_data_size(message)
         with self._state_lock:
             self._rx_bytes += data_size
-            if (
-                token is not self._active_token
-                or self._state is not TransportState.OPEN
-                or generation != self._generation
-            ):
-                self._receive_router.record_stale()
-                return
-            self._last_successful_rx_s = self._monotonic()
-            self._consecutive_errors = 0
-            self._receive_router.route(message, generation=generation)
+            is_current = (
+                token is self._active_token
+                and self._state is TransportState.OPEN
+                and generation == self._generation
+            )
+            if is_current:
+                self._last_successful_rx_s = self._monotonic()
+                self._consecutive_errors = 0
+        if not is_current:
+            self._receive_router.record_stale()
+            return
+        self._receive_router.route(message, generation=generation)
 
     def _measure_data_size(self, message: MessageT) -> int:
         try:
@@ -355,7 +361,7 @@ class ManagedMessageTransport(Generic[MessageT]):
             if token is not self._active_token:
                 return
             classified = self._record_error(error, faulted=True)
-            self._receive_router.abort(classified)
+        self._receive_router.abort(classified)
 
     def _record_error(self, error: BaseException, *, faulted: bool) -> LinkerbotError:
         classified = normalize_error(error)

@@ -11,6 +11,7 @@ from linkerbot_transport.errors import (
     DeviceNotReadyError,
     DeviceStateError,
     QueueFullError,
+    TransportError,
     ValidationError,
 )
 from linkerbot_transport.routing import CANRouteKey, ReceiveRouter
@@ -94,6 +95,66 @@ def test_route_queue_is_bounded_and_drops_newest_on_overflow() -> None:
     assert health.max_queue_depth == 1
     assert health.queue_depth == 0
     router.close()
+
+
+def test_availability_notifier_is_edge_triggered_and_wakes_on_close() -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    available = threading.Event()
+    route = router.subscribe(3, on_available=available.set)
+
+    assert router.route(3, generation=1)
+    assert available.wait(timeout=1.0)
+    available.clear()
+
+    assert router.route(3, generation=1)
+    assert not available.is_set()
+    assert route.receive(timeout_s=0).message == 3
+    assert route.receive(timeout_s=0).message == 3
+
+    assert router.route(3, generation=1)
+    assert available.wait(timeout=1.0)
+    available.clear()
+    route.close()
+    assert available.wait(timeout=1.0)
+
+    available.clear()
+    assert not router.route(3, generation=1)
+    assert not available.is_set()
+    router.close()
+
+
+def test_availability_notifier_failure_does_not_break_receive_routing() -> None:
+    calls = 0
+
+    def fail() -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("notifier failed")
+
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    route = router.subscribe(7, on_available=fail)
+
+    assert router.route(7, generation=1)
+    assert route.receive(timeout_s=0).message == 7
+    assert router.route(7, generation=1)
+    assert route.receive(timeout_s=0).message == 7
+    assert calls == 1
+    router.close()
+
+
+def test_availability_notifier_wakes_consumer_on_router_abort() -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    available = threading.Event()
+    route = router.subscribe(9, on_available=available.set)
+
+    router.abort(RuntimeError("bus disconnected"))
+
+    assert available.wait(timeout=1.0)
+    with pytest.raises(TransportError, match="bus disconnected"):
+        route.try_receive()
 
 
 def test_registry_is_bounded_and_route_keys_are_exclusive() -> None:

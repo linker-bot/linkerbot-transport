@@ -189,6 +189,65 @@ def test_receive_overflow_and_queue_depth_are_reported_in_transport_health() -> 
     transport.close()
 
 
+def test_receive_route_notifier_runs_outside_transport_state_lock() -> None:
+    transport = FakeTransport[int]()
+    transport.open()
+    state_lock_available = False
+
+    def notify() -> None:
+        nonlocal state_lock_available
+        acquired: list[bool] = []
+
+        def probe() -> None:
+            lock_acquired = transport._state_lock.acquire(blocking=False)
+            acquired.append(lock_acquired)
+            if lock_acquired:
+                transport._state_lock.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(timeout=1.0)
+        state_lock_available = acquired == [True]
+
+    route = transport.subscribe_route(1, on_available=notify)
+
+    transport.emit(1)
+
+    assert state_lock_available
+    assert route.receive(timeout_s=0).message == 1
+    transport.close()
+
+
+def test_route_abort_notifier_runs_outside_transport_state_lock() -> None:
+    transport = FakeTransport[int]()
+    transport.open()
+    state_lock_available = False
+
+    def notify() -> None:
+        nonlocal state_lock_available
+        acquired: list[bool] = []
+
+        def probe() -> None:
+            lock_acquired = transport._state_lock.acquire(blocking=False)
+            acquired.append(lock_acquired)
+            if lock_acquired:
+                transport._state_lock.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(timeout=1.0)
+        state_lock_available = acquired == [True]
+
+    route = transport.subscribe_route(1, on_available=notify)
+
+    transport.current_dispatcher.disconnect(OSError("unplugged"))
+
+    assert state_lock_available
+    with pytest.raises(TransportError, match="unplugged"):
+        route.receive(timeout_s=0)
+    transport.close()
+
+
 def test_can_and_canfd_health_count_dlc_data_bytes() -> None:
     can_dispatchers: list[FakeDispatcher[can.Message]] = []
     canfd_dispatchers: list[FakeDispatcher[CANFDMessage]] = []

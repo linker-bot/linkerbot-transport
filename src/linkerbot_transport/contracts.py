@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, TypeVar, runtime_checkable
@@ -100,8 +100,9 @@ class MessageTransport(TransportLifecycle, Protocol[MessageT]):
         route_key: Hashable,
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, Hashable]:
-        """Open one exclusive bounded receive route."""
+        """Open one route with an optional synchronous availability notifier."""
         ...
 
     def subscribe_routes(
@@ -109,8 +110,9 @@ class MessageTransport(TransportLifecycle, Protocol[MessageT]):
         route_keys: Iterable[Hashable],
         *,
         queue_capacity: int | None = None,
+        on_available: Callable[[], None] | None = None,
     ) -> RouteSubscription[MessageT, Hashable]:
-        """Open one bounded inbox shared by several exact receive routes."""
+        """Open one route group with an optional availability notifier."""
         ...
 
 
