@@ -131,6 +131,11 @@ routes = transport.subscribe_routes(
 容量限制作用于整组数据流。注册要么一次取得全部 key，要么一个也不取得；关闭订阅
 会释放整组 key。所有命中帧按到达顺序进入同一个队列。
 
+SDK actor 可在订阅时传入 `on_available=event.set`。空路由首次变为可读，以及路由关闭
+或中止时，都会以边沿方式通知 actor，使其可以直接消费 Transport 队列，不再增加第二层
+mailbox 线程。回调在路由路径同步执行，必须立即返回，不能执行协议事务或阻塞；回调抛出
+异常时会记录日志并禁用该路由的后续通知，但不会终止 RX。
+
 `RoutedMessage` 包含单调时钟接收时间、连接代次和该代次内的序号。inbox 已满时，
 新帧会被丢弃，同时增加路由和 Transport 的 overflow 计数。路由未命中、key 提取
 错误、旧代次帧、队列深度和关闭时丢帧也都会记录在缓存健康状态中。
@@ -205,6 +210,22 @@ arbiter 会失败旧连接代次的全部待发送任务，重新打开后不会
 
 `replace_latest_if_pending()` 只覆盖尚未被 worker 领取的目标；旧目标已经在途或不存在
 时返回 `None`，不会再排入第二个目标，从而保护协议请求与响应的相关性。
+
+已经拥有 I/O actor 的运行时可使用 `TransmitMode.CALLER`，避免再创建常驻 TX worker。
+提交仍然只负责接纳有界任务并返回 receipt，随后由 actor 调用 `drain()` 完成实际发送。
+多个 actor 并发调用时，第一个调用者临时取得单写入权，并继续处理其持有期间新进入的
+任务。`drain()` 会执行 Transport I/O，只能由 I/O actor 调用，不能放在用户或 ROS
+callback 中：
+
+```python
+from linkerbot_transport import TransmitArbiter, TransmitMode
+
+arbiter = TransmitArbiter(transport.send, mode=TransmitMode.CALLER)
+arbiter.open(generation=generation)
+receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
+arbiter.drain()
+receipt.result(timeout=0.1)
+```
 
 ## CAN FD 说明
 

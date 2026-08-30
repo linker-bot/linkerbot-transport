@@ -133,6 +133,13 @@ routes = transport.subscribe_routes(
 The capacity applies to the combined stream. Registration either claims every
 key or none, and closing the subscription releases the complete group.
 
+An SDK actor can pass `on_available=event.set` when subscribing. The callback
+is edge-triggered when an empty route becomes readable and is also invoked when
+the route closes or aborts, so the actor can consume the transport queue
+directly without a second mailbox thread. It runs synchronously on the routing
+path, must return immediately, and must never perform protocol work or block.
+An exception is logged and disables that route's notifier without stopping RX.
+
 `RoutedMessage` also contains a monotonic receive timestamp and per-generation
 sequence number. A full inbox drops the newly received frame and increments
 the route and transport overflow counters. Route misses, key errors, stale
@@ -209,6 +216,23 @@ superseded, failed and capacity-rejection counters.
 `replace_latest_if_pending()` returns `None` once the prior keyed job has been
 claimed or no such job exists. It never queues a second job behind an in-flight
 request, which lets protocol runtimes preserve response-correlation ordering.
+
+Runtimes that already own an I/O actor can use `TransmitMode.CALLER` to avoid a
+second permanent TX worker. Submission still only admits bounded work and
+returns a receipt; the actor then calls `drain()` to dispatch it. The first
+concurrent caller temporarily owns the writer and drains work admitted while it
+is active. `drain()` performs transport I/O and therefore belongs only in the
+I/O actor, never in a user or ROS callback:
+
+```python
+from linkerbot_transport import TransmitArbiter, TransmitMode
+
+arbiter = TransmitArbiter(transport.send, mode=TransmitMode.CALLER)
+arbiter.open(generation=generation)
+receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
+arbiter.drain()
+receipt.result(timeout=0.1)
+```
 
 A failed CAN FD batch fails every receipt because the backend cannot identify a
 partial success safely. Device runtimes receive through exact bounded routes;
