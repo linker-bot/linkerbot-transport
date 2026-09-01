@@ -15,15 +15,23 @@ The package does not depend on ROS, hand models, arm models or kinematics.
 Install only the backend required by the application:
 
 ```bash
-pip install "linkerbot-transport[can]"
-pip install "linkerbot-transport[canfd]"
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  --extra-index-url https://pypi.org/simple \
+  "linkerbot-transport[can]==1.0.0"
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  --extra-index-url https://pypi.org/simple \
+  "linkerbot-transport[canfd]==1.0.0"
 ```
 
 The dependency-free base package can be installed for error types and
 concurrency primitives:
 
 ```bash
-pip install linkerbot-transport
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  "linkerbot-transport==1.0.0"
 ```
 
 ## Public API

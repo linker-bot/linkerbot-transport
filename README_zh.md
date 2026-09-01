@@ -14,14 +14,22 @@ CAN、厂商 CAN FD 和 Linux SocketCAN FD 实现，以及传输边界需要的�
 只安装应用需要的后端：
 
 ```bash
-pip install "linkerbot-transport[can]"
-pip install "linkerbot-transport[canfd]"
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  --extra-index-url https://pypi.org/simple \
+  "linkerbot-transport[can]==1.0.0"
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  --extra-index-url https://pypi.org/simple \
+  "linkerbot-transport[canfd]==1.0.0"
 ```
 
 如果只需要异常类型和通用并发契约，可以安装不带 `python-can` 的基础包：
 
 ```bash
-pip install linkerbot-transport
+python -m pip install \
+  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
+  "linkerbot-transport==1.0.0"
 ```
 
 ## 公共 API
