@@ -1,0 +1,26 @@
+# Local gates mirroring .gitea/workflows/ci.yml.
+#
+# Install once per clone:
+#     pre-commit install
+#
+# ``repo: local`` with ``language: system`` deliberately calls the ruff already
+# installed in this environment (dev dependency group) instead of pulling
+# astral-sh/ruff-pre-commit. That mirror ships its own pinned ruff, which would
+# leave the hook, a manual ``ruff check`` and CI on three different versions.
+# Rule selection always comes from pyproject.toml.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format --check
+        entry: ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
