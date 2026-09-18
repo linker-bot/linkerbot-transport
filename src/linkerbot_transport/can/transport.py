@@ -22,10 +22,18 @@ class CANTransportKey:
 
     interface_name: str
     interface_type: str = "socketcan"
+    routing_identity: int | None = None
 
 
 class CANTransport(ManagedMessageTransport[can.Message]):
-    """Classic CAN transport whose constructor performs no device I/O."""
+    """Classic CAN transport whose constructor performs no device I/O.
+
+    ``route_key_of`` optionally extracts a protocol address from a received
+    message. It must be a fast, side-effect-free function returning CANRouteKey.
+    The original message is delivered unchanged. By default the full CAN ID
+    and frame format identify a route. Custom extractors have distinct pool
+    keys by callable identity, so different routing policies cannot alias.
+    """
 
     def __init__(
         self,
@@ -35,6 +43,7 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
         dispatcher_factory: DispatcherFactory[can.Message] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        route_key_of: Callable[[can.Message], CANRouteKey] | None = None,
     ) -> None:
         if not isinstance(interface_name, str) or not interface_name:
             raise ValidationError("interface_name must be a non-empty string")
@@ -47,7 +56,13 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         ):
             raise ValidationError("max_consecutive_errors must be a positive int")
         self._can_interface = CanInterface(interface_name, interface_type)
-        self._key = CANTransportKey(interface_name, interface_type)
+        if route_key_of is not None and not callable(route_key_of):
+            raise ValidationError("route_key_of must be callable")
+        self._key = CANTransportKey(
+            interface_name,
+            interface_type,
+            None if route_key_of is None else id(route_key_of),
+        )
 
         if dispatcher_factory is None:
 
@@ -66,7 +81,7 @@ class CANTransport(ManagedMessageTransport[can.Message]):
             resolved_factory = dispatcher_factory
         super().__init__(
             resolved_factory,
-            _can_route_key,
+            _can_route_key if route_key_of is None else route_key_of,
             data_size_of=_can_data_size,
             monotonic=monotonic,
         )

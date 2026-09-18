@@ -138,6 +138,16 @@ routes = transport.subscribe_routes(
 )
 ```
 
+For protocols that encode changing status bits in the CAN ID, classic
+`CANTransport` also accepts `route_key_of=extract_address`. The function receives
+the original `can.Message` and returns a stable `CANRouteKey`; subscribers use
+that same key. It must be fast and perform no I/O. The delivered message retains
+its original arbitration ID, flags and payload. Keep the standard/extended flag
+in the extracted key. Extractor exceptions are counted as route-key errors and
+the malformed frame is dropped, as with default routing. Custom extractors are
+distinguished by callable identity in `pool_key`; reuse the same callable only
+when its routing policy is identical. Device SDKs own the protocol extraction.
+
 The capacity applies to the combined stream. Registration either claims every
 key or none, and closing the subscription releases the complete group.
 
