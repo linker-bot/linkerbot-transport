@@ -6,9 +6,10 @@ import math
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from enum import Enum
+from itertools import islice
 from typing import Generic, TypeVar
 
 from .errors import (
@@ -20,7 +21,7 @@ from .errors import (
     ValidationError,
     normalize_error,
 )
-from .receipts import SendOutcome, SendReceipt
+from .receipts import BatchSendReceipt, SendOutcome, SendReceipt
 
 MessageT = TypeVar("MessageT")
 
@@ -72,7 +73,13 @@ class SendOptions:
 
 @dataclass(frozen=True, slots=True)
 class TransmitHealth:
-    """Immutable, zero-I/O snapshot of arbiter state and counters."""
+    """Immutable, zero-I/O snapshot of arbiter state and counters.
+
+    Pending/in-flight sizes count frames (in_flight_frames is the entire
+    claimed batch). Outcome/rejection counters count submissions, so one
+    batch is one accepted/dispatched/failed job. Oldest age includes in-flight
+    work: a blocked physical send is part of transmit latency too.
+    """
 
     running: bool
     generation: int
@@ -84,6 +91,10 @@ class TransmitHealth:
     superseded: int
     failed: int
     rejected_full: int
+    expired: int = 0
+    rejected_stale: int = 0
+    oldest_pending_age_s: float | None = None
+    in_flight_frames: int = 0
 
     @property
     def pending_total(self) -> int:
@@ -98,6 +109,11 @@ class _PendingSend(Generic[MessageT]):
     options: SendOptions
     receipt: SendReceipt
     sequence: int
+    batch: tuple[MessageT, ...] | None = None
+
+    @property
+    def frame_count(self) -> int:
+        return 1 if self.batch is None else len(self.batch)
 
 
 class TransmitArbiter(Generic[MessageT]):
@@ -172,6 +188,8 @@ class TransmitArbiter(Generic[MessageT]):
         self._superseded = 0
         self._failed = 0
         self._rejected_full = 0
+        self._expired = 0
+        self._rejected_stale = 0
 
     def open(self, *, generation: int) -> None:
         """Open one worker-backed or caller-drained generation idempotently."""
@@ -284,6 +302,50 @@ class TransmitArbiter(Generic[MessageT]):
     def submit(self, message: MessageT, options: SendOptions) -> SendReceipt:
         """Accept one bounded send and return immediately with its receipt."""
 
+        return self._submit(message, options)
+
+    def submit_fifo_batch(
+        self,
+        messages: Iterable[MessageT],
+        *,
+        endpoint_id: Hashable,
+        priority: int = 0,
+        deadline_at_s: float | None = None,
+        max_pending_age_s: float | None = None,
+    ) -> BatchSendReceipt:
+        """Admit all frames or none, then dispatch them without interleaving.
+
+        Capacity counts frames. The deadline is checked before the first frame
+        only; an already-started batch is never truncated by its deadline.
+        A backend failure stops the batch and the receipt exposes its sent prefix.
+        Optional admission age includes the oldest queued or in-flight work.
+        """
+        batch = tuple(islice(messages, self._fifo_capacity + 1))
+        if not batch:
+            raise ValidationError("a FIFO batch must contain at least one frame")
+        if max_pending_age_s is not None:
+            _validate_positive_float(max_pending_age_s, "max_pending_age_s")
+        options = SendOptions(
+            endpoint_id=endpoint_id,
+            policy=SendPolicy.FIFO,
+            priority=priority,
+            deadline_at_s=deadline_at_s,
+        )
+        receipt = self._submit(
+            batch[0], options, batch=batch, max_pending_age_s=max_pending_age_s
+        )
+        assert isinstance(receipt, BatchSendReceipt)
+        return receipt
+
+    def _submit(
+        self,
+        message: MessageT,
+        options: SendOptions,
+        *,
+        batch: tuple[MessageT, ...] | None = None,
+        max_pending_age_s: float | None = None,
+    ) -> SendReceipt:
+
         if not isinstance(options, SendOptions):
             raise ValidationError("options must be SendOptions")
 
@@ -294,6 +356,19 @@ class TransmitArbiter(Generic[MessageT]):
             now = self._monotonic()
             if options.deadline_at_s is not None and options.deadline_at_s <= now:
                 raise TimeoutError("send deadline has already expired")
+            oldest = (
+                self._oldest_accepted_locked()
+                if max_pending_age_s is not None
+                else None
+            )
+            if (
+                max_pending_age_s is not None
+                and oldest is not None
+                and now - oldest >= max_pending_age_s
+            ):
+                self._rejected_stale += 1
+                raise TimeoutError("pending transmit work exceeded the age budget")
+            frame_count = 1 if batch is None else len(batch)
             latest_key = (options.endpoint_id, options.command_family)
             if (
                 options.policy is SendPolicy.LATEST
@@ -304,14 +379,19 @@ class TransmitArbiter(Generic[MessageT]):
                 raise QueueFullError("transmit latest slots are full")
             if (
                 options.policy is SendPolicy.FIFO
-                and self._fifo_size >= self._fifo_capacity
+                and self._fifo_size + frame_count > self._fifo_capacity
             ):
                 self._rejected_full += 1
                 raise QueueFullError("transmit FIFO is full")
 
-            receipt = SendReceipt(
-                generation=self._generation,
-                monotonic=self._monotonic,
+            receipt = (
+                SendReceipt(generation=self._generation, monotonic=self._monotonic)
+                if batch is None
+                else BatchSendReceipt(
+                    frame_count=frame_count,
+                    generation=self._generation,
+                    monotonic=self._monotonic,
+                )
             )
             self._next_sequence += 1
             pending = _PendingSend(
@@ -319,6 +399,7 @@ class TransmitArbiter(Generic[MessageT]):
                 options=options,
                 receipt=receipt,
                 sequence=self._next_sequence,
+                batch=batch,
             )
             if options.policy is SendPolicy.LATEST:
                 previous = self._latest.get(latest_key)
@@ -328,7 +409,7 @@ class TransmitArbiter(Generic[MessageT]):
                     self._superseded += 1
             else:
                 self._fifo[options.endpoint_id].append(pending)
-                self._fifo_size += 1
+                self._fifo_size += frame_count
             self._accepted += 1
             self._condition.notify()
 
@@ -462,6 +543,7 @@ class TransmitArbiter(Generic[MessageT]):
         """Return current queue state without transport I/O."""
 
         with self._condition:
+            oldest = self._oldest_accepted_locked()
             worker = self._worker
             running = self._accepting and (
                 self._mode is TransmitMode.CALLER
@@ -478,6 +560,14 @@ class TransmitArbiter(Generic[MessageT]):
                 superseded=self._superseded,
                 failed=self._failed,
                 rejected_full=self._rejected_full,
+                expired=self._expired,
+                rejected_stale=self._rejected_stale,
+                oldest_pending_age_s=(
+                    None if oldest is None else max(0.0, self._monotonic() - oldest)
+                ),
+                in_flight_frames=(
+                    0 if self._in_flight is None else self._in_flight.frame_count
+                ),
             )
 
     def _stop(self, error: BaseException) -> None:
@@ -599,13 +689,26 @@ class TransmitArbiter(Generic[MessageT]):
         try:
             deadline = job.options.deadline_at_s
             if deadline is not None and deadline <= self._monotonic():
+                with self._condition:
+                    self._expired += 1
                 raise TimeoutError("send deadline expired before dispatch")
-            downstream = self._dispatch(job.message)
-            if not isinstance(downstream, SendReceipt):
-                raise TransportError("dispatch must return SendReceipt")
-            result = downstream.result()
-            if result.outcome is not SendOutcome.DISPATCHED:
-                raise TransportError(f"downstream send ended as {result.outcome.value}")
+            messages = (job.message,) if job.batch is None else job.batch
+            for index, message in enumerate(messages):
+                # Close can cancel the unsent suffix; it must not replay on open.
+                if index:
+                    with self._condition:
+                        if not self._accepting:
+                            raise ClosedError("transmit closed during batch dispatch")
+                downstream = self._dispatch(message)
+                if not isinstance(downstream, SendReceipt):
+                    raise TransportError("dispatch must return SendReceipt")
+                result = downstream.result()
+                if result.outcome is not SendOutcome.DISPATCHED:
+                    raise TransportError(
+                        f"downstream send ended as {result.outcome.value}"
+                    )
+                if isinstance(job.receipt, BatchSendReceipt):
+                    job.receipt._frame_dispatched()
             dispatched = True
         except BaseException as error:  # noqa: BLE001 - receipt owns worker errors
             failure = normalize_error(error)
@@ -641,7 +744,7 @@ class TransmitArbiter(Generic[MessageT]):
             claimed = queue.popleft()
             if claimed is not job:
                 raise RuntimeError("transmit FIFO order was corrupted")
-            self._fifo_size -= 1
+            self._fifo_size -= job.frame_count
             if not queue:
                 del self._fifo[options.endpoint_id]
 
@@ -664,6 +767,13 @@ class TransmitArbiter(Generic[MessageT]):
     def _has_pending_locked(self) -> bool:
         return bool(self._latest) or self._fifo_size > 0
 
+    def _oldest_accepted_locked(self) -> float | None:
+        heads = list(self._latest.values())
+        heads.extend(queue[0] for queue in self._fifo.values() if queue)
+        if self._in_flight is not None:
+            heads.append(self._in_flight)
+        return min((job.receipt.accepted_at_s for job in heads), default=None)
+
     def _take_all_pending_locked(self) -> tuple[_PendingSend[MessageT], ...]:
         pending = list(self._latest.values())
         self._latest.clear()
@@ -681,7 +791,7 @@ class TransmitArbiter(Generic[MessageT]):
         fifo = self._fifo.pop(endpoint_id, None)
         if fifo is not None:
             pending.extend(fifo)
-            self._fifo_size -= len(fifo)
+            self._fifo_size -= sum(job.frame_count for job in fifo)
         return tuple(pending)
 
 

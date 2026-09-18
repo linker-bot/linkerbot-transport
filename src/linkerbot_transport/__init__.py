@@ -21,7 +21,7 @@ from .errors import (
     normalize_error,
 )
 from .pool import SharedTransportPool, TransportLease
-from .receipts import SendOutcome, SendReceipt, SendResult
+from .receipts import BatchSendReceipt, SendOutcome, SendReceipt, SendResult
 from .routing import (
     CANRouteKey,
     ReceiveRouter,
@@ -39,6 +39,7 @@ from .transmit import (
 )
 
 __all__ = [
+    "BatchSendReceipt",
     "CANRouteKey",
     "ClosedError",
     "DeviceFaultError",

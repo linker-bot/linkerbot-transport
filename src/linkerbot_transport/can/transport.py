@@ -74,6 +74,7 @@ class CANTransport(ManagedMessageTransport[can.Message]):
                     interface_type=interface_type,
                     on_bus_error=on_bus_error,
                     max_consecutive_errors=max_consecutive_errors,
+                    start_send_worker=False,
                 )
 
             resolved_factory: DispatcherFactory[can.Message] = create

@@ -63,6 +63,8 @@ class CANMessageDispatcher:
         interface_type: str = "socketcan",
         on_bus_error: Callable[[Exception], None] | None = None,
         max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
+        *,
+        start_send_worker: bool = True,
     ) -> None:
         """Initialize the CAN message dispatcher.
 
@@ -71,6 +73,8 @@ class CANMessageDispatcher:
             interface_type: Type of CAN interface backend (default: "socketcan").
             on_bus_error: Optional callback invoked once when the bus becomes unavailable.
             max_consecutive_errors: Number of consecutive errors before declaring bus dead.
+            start_send_worker: Start the legacy queue worker eagerly. If False,
+                send() starts it lazily; send_now() never needs this worker.
         """
         if (
             not isinstance(max_consecutive_errors, int)
@@ -79,6 +83,8 @@ class CANMessageDispatcher:
         ):
             raise ValidationError("max_consecutive_errors must be a positive int")
 
+        if not isinstance(start_send_worker, bool):
+            raise ValidationError("start_send_worker must be bool")
         self._can_interface = CanInterface(
             interface_name=interface_name, interface_type=interface_type
         )
@@ -110,7 +116,8 @@ class CANMessageDispatcher:
             target=self._send_loop, daemon=True, name="CANMessageDispatcher.send_loop"
         )
         self._recv_thread.start()
-        self._send_thread.start()
+        if start_send_worker:
+            self._send_thread.start()
 
     @property
     def can_interface(self) -> CanInterface:
@@ -263,6 +270,10 @@ class CANMessageDispatcher:
         receipt = SendReceipt()
         with self._error_lock:
             self._raise_if_cannot_send_locked()
+            # High-level transports use send_now exclusively. Start the legacy
+            # queue worker only if a caller actually chooses asynchronous send.
+            if self._send_thread.ident is None:
+                self._send_thread.start()
             self._receipts.register(receipt)
             try:
                 self._send_queue.put_nowait(_QueuedSend(msg, receipt))

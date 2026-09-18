@@ -4,6 +4,18 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add `TransmitArbiter.submit_fifo_batch()` with all-or-none, frame-counted
+  admission and non-interleaved dispatch. `BatchSendReceipt` exposes successful
+  frame progress even after failure. Optional pending-age admission and
+  pre-dispatch deadlines bound stale targets without enlarging queues.
+- Expose expired/rejected-stale counts, oldest pending or in-flight age and
+  in-flight batch size in zero-I/O transmit health. Outcome counters count jobs;
+  capacity and pending sizes count frames.
+
+- Avoid starting the unused legacy CAN send worker in `CANTransport`.
+  Direct dispatcher users retain eager startup by default; lazy dispatchers
+  start that worker only if their asynchronous `send()` is actually used.
+
 - Add the repository gates this package was missing entirely. It is a dependency of both `linkerbot-hand` and `linkerbot-hand-ros` and has six versions in the package registry, yet it had no CI, no pre-commit hooks and no release script — the only one of the three repositories with nothing but a `MANIFEST.in`. `.gitea/workflows/ci.yml` runs `ruff check` and `ruff format --check` on pushes to `main` and on pull requests, plus one pull-request check: changing `src/` without touching `CHANGELOG.md` fails, with a `[skip changelog]` escape in the pull-request title for a genuine internal refactor. `.pre-commit-config.yaml` uses `repo: local` to call the ruff already in the environment rather than pulling `ruff-pre-commit`, which ships its own pinned version, so the hook, a manual run and CI stay on one ruff and one rule set; each clone needs `pre-commit install` once, and with no Gitea runner online the push hook is the gate that actually takes effect. The rule set is unchanged (`E4`/`E7`/`E9`/`F`/`I`/`UP`). `pre-commit` and `twine` joined the dev dependency group — the latter was already required by the release path and undeclared.
 
 - Add a release flow: `scripts/release.py` (`check` / `tag` / `publish`) and `.gitea/workflows/release.yml`, documented in [scripts/README.md](scripts/README.md). A release here is **six** things staying consistent: the version in `pyproject.toml`, a dated `CHANGELOG.md` section, the pinned version in both READMEs, a signed tag, the registry artifacts, and a Gitea Release carrying those artifacts. The 2.0.0 releases of hand and ROS got the first two right, missed the next three — producing a version nobody could install — and then missed the sixth even after the rest was repaired, leaving the only tag in either repository without a Release. `check` gates all of it: clean tracked tree, `main` equal to `origin/main`, a dated section with an empty `Unreleased`, both READMEs pinning exactly this version and no other (the `[can]`/`[canfd]` extras forms as well as the bare one), an unused tag, `ruff` and `pytest`, and the version not already published. An unreachable registry reports "not checked" rather than reading as "nothing is published", so one network failure cannot wave through a re-upload. `publish` additionally verifies the artifacts rather than just the build: `twine check`, the wheel metadata version, the version pinned in the wheel's long description (`readme` puts README inside the artifact, so a stale pin is permanent), and that the sdist contains no untracked file. It then uploads and creates the Gitea Release with the CHANGELOG section as its body and both artifacts attached. Idempotent throughout: the upload is skipped when the registry already has the version and the Release when one already exists, so a local run and a CI run cannot double-publish.

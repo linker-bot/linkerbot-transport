@@ -237,6 +237,33 @@ receipt.result(timeout=0.1)
 
 ## CAN FD 说明
 
+### 整组 FIFO 准入
+
+先完成全部编码，再一次提交一组目标：
+
+```python
+receipt = arbiter.submit_fifo_batch(
+    joint_frames,
+    endpoint_id="arm",
+    deadline_at_s=time.monotonic() + 0.02,
+    max_pending_age_s=0.02,
+)
+```
+
+FIFO 容量按帧计算。七帧空间不足时整组抛 `QueueFullError`，零帧入队。
+可选 `max_pending_age_s` 在排队或正在发送的工作已达到年龄预算时抛 `TimeoutError`；
+它不预测硬件耗时。截止时间只在组内第一帧发送前检查，过期整组失败；已经开始的组
+不会因为截止时间只发送一半。组内不会插入其他排队任务，但物理故障或关闭可能中止
+尚未发送的后缀。通过 `receipt.sent_frames` 查看后端已成功返回的帧数，
+`receipt.frame_count` 查看整组大小。原子准入不代表物理原子执行或电机确认。
+
+`get_health()` 新增 `expired`、`rejected_stale`、`oldest_pending_age_s`（包括正在发送的工作）
+和 `in_flight_frames`（正在处理的一组的总帧数）。待发容量按帧计算，
+accepted/dispatched/failed/expired 按提交计数：七帧一组只记一次。原单帧接口及默认策略不变。
+
+经典 `CANTransport` 直接发送，不再启动闲置的底层队列发送线程。直接使用内部 dispatcher
+仍默认立即启动该线程；设置 `start_send_worker=False` 后，第一次异步 `send()` 才启动它。
+
 CAN FD 批量发送失败时，后端无法可靠判断部分成功数量，因此同一批次的所有 receipt
 都会失败。设备运行时应通过精确有界路由接收数据；内部 worker 不属于 1.0 兼容契约。
 

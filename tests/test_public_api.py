@@ -23,6 +23,7 @@ from linkerbot_transport import (
 from linkerbot_transport import can as classic_can
 
 ROOT_EXPORTS = {
+    "BatchSendReceipt",
     "CANRouteKey",
     "ClosedError",
     "DeviceFaultError",

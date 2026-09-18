@@ -252,6 +252,38 @@ arbiter.drain()
 receipt.result(timeout=0.1)
 ```
 
+For an inseparable group of FIFO targets, prepare all frames first and use one
+atomic admission:
+
+```python
+receipt = arbiter.submit_fifo_batch(
+    joint_frames,
+    endpoint_id="arm",
+    deadline_at_s=time.monotonic() + 0.02,
+    max_pending_age_s=0.02,
+)
+```
+
+Capacity counts frames: a seven-frame batch needs seven free FIFO slots or raises
+`QueueFullError` without enqueuing any of it. `max_pending_age_s` is optional and
+rejects with `TimeoutError` if queued or in-flight work has already reached that
+age. It does not predict bus latency. The deadline is checked before the first
+frame; an already-started batch is not truncated by its deadline. Normal jobs and
+other batches cannot interleave within it. Close or a backend failure can still
+stop an unsent suffix. `receipt.sent_frames` reports the successful backend prefix
+on failure, while `receipt.frame_count` records the admitted size. Acceptance is
+atomic; physical execution and motor acknowledgement are not.
+
+`get_health()` exposes `expired`, `rejected_stale`, `oldest_pending_age_s` (including
+in-flight work), and `in_flight_frames` (the entire claimed batch). Pending counts
+measure frames; accepted/dispatched/failed/expired counters measure submissions,
+so a seven-frame batch counts as one job. Existing single-message calls and their
+default policies are unchanged.
+
+Classic `CANTransport` uses direct dispatch without an idle legacy TX worker.
+Direct internal-dispatcher users still get the original eager worker by default;
+`start_send_worker=False` defers it until asynchronous `send()` is actually used.
+
 A failed CAN FD batch fails every receipt because the backend cannot identify a
 partial success safely. Device runtimes receive through exact bounded routes;
 the internal channel workers are not part of the 1.0 compatibility contract.

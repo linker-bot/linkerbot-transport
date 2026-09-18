@@ -179,6 +179,35 @@ class SendReceipt(Future[SendResult]):
             return True
 
 
+class BatchSendReceipt(SendReceipt):
+    """One atomically admitted FIFO batch, with observable physical progress.
+
+    ``sent_frames`` includes only successful backend sends. A failure may leave
+    a physically sent prefix; admission is atomic, hardware execution is not.
+    """
+
+    def __init__(self, *, frame_count: int, **kwargs) -> None:
+        if type(frame_count) is not int or frame_count <= 0:
+            raise ValueError("frame_count must be a positive int")
+        super().__init__(**kwargs)
+        self._frame_count = frame_count
+        self._sent_frames = 0
+
+    @property
+    def frame_count(self) -> int:
+        """Total number of frames atomically admitted in this batch."""
+        return self._frame_count
+
+    @property
+    def sent_frames(self) -> int:
+        with self._transition_lock:
+            return self._sent_frames
+
+    def _frame_dispatched(self) -> None:
+        with self._transition_lock:
+            self._sent_frames += 1
+
+
 class _ReceiptTracker:
     """Thread-safe ownership of receipts not yet completed by a send loop."""
 
@@ -217,4 +246,4 @@ class _ReceiptTracker:
             return True
 
 
-__all__ = ["SendOutcome", "SendReceipt", "SendResult"]
+__all__ = ["BatchSendReceipt", "SendOutcome", "SendReceipt", "SendResult"]
