@@ -89,9 +89,6 @@ class CANMessageDispatcher:
             interface_name=interface_name, interface_type=interface_type
         )
         self._bitrate = 1_000_000
-        self._bus: can.BusABC = can.Bus(
-            channel=interface_name, interface=interface_type, bitrate=self._bitrate
-        )
         self._subscribers: list[Callable[[can.Message], None]] = []
         self._subscribers_lock = threading.Lock()
         self._running = True
@@ -115,9 +112,26 @@ class CANMessageDispatcher:
         self._send_thread: threading.Thread = threading.Thread(
             target=self._send_loop, daemon=True, name="CANMessageDispatcher.send_loop"
         )
-        self._recv_thread.start()
-        if start_send_worker:
-            self._send_thread.start()
+        # Set up all cleanup state before acquiring the physical resource.
+        self._bus: can.BusABC = can.Bus(
+            channel=interface_name, interface=interface_type, bitrate=self._bitrate
+        )
+        try:
+            self._recv_thread.start()
+            if start_send_worker:
+                self._send_thread.start()
+        except BaseException as error:
+            try:
+                # Do not dispatch to a subclass's partially initialized stop().
+                CANMessageDispatcher.stop(self)
+            except BaseException:
+                self._logger.exception(
+                    "CAN startup rollback failed; cleanup must retry"
+                )
+                # ManagedMessageTransport can retain this otherwise unreturned
+                # object. Preserve the original exception, including Ctrl+C.
+                error._failed_dispatcher = self
+            raise
 
     @property
     def can_interface(self) -> CanInterface:

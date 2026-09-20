@@ -140,12 +140,18 @@ class ManagedMessageTransport(Generic[MessageT]):
                         if self._opening_error is not None:
                             raise self._opening_error
                         raise DeviceNotReadyError("dispatcher failed while opening")
-            except Exception as error:
+            except BaseException as error:
+                # A CAN constructor can fail after opening its bus. If its own
+                # rollback also failed, take ownership for an explicit retry.
+                if dispatcher is None:
+                    dispatcher = getattr(error, "_failed_dispatcher", None)
+                with self._state_lock:
+                    self._active_token = None
                 self._receive_router.close()
                 if dispatcher is not None:
                     try:
                         dispatcher.stop()
-                    except Exception as cleanup_error:
+                    except BaseException as cleanup_error:
                         self._logger.warning(
                             "dispatcher cleanup after open failure failed: %s",
                             cleanup_error,
@@ -154,11 +160,11 @@ class ManagedMessageTransport(Generic[MessageT]):
                             self._dispatcher = dispatcher
                             self._receive_callback = on_message
                         self._record_error(cleanup_error, faulted=True)
-                with self._state_lock:
-                    self._active_token = None
                 classified = self._record_error(error, faulted=True)
                 with self._state_lock:
                     self._opening_error = None
+                if not isinstance(error, Exception):
+                    raise
                 _raise_classified(classified, error)
 
             with self._state_lock:
@@ -186,20 +192,21 @@ class ManagedMessageTransport(Generic[MessageT]):
                 self._active_token = None
                 self._receive_router.close()
 
-            if receive_callback is not None:
-                try:
-                    dispatcher.unsubscribe(receive_callback)
-                except Exception as error:
-                    self._logger.warning(
-                        "dispatcher unsubscribe during close failed: %s", error
-                    )
-
             try:
+                if receive_callback is not None:
+                    try:
+                        dispatcher.unsubscribe(receive_callback)
+                    except Exception as error:
+                        self._logger.warning(
+                            "dispatcher unsubscribe during close failed: %s", error
+                        )
                 dispatcher.stop()
-            except Exception as error:
+            except BaseException as error:
                 classified = self._record_error(error, faulted=False)
                 with self._state_lock:
                     self._state = TransportState.FAULTED
+                if not isinstance(error, Exception):
+                    raise
                 _raise_classified(classified, error)
 
             with self._state_lock:

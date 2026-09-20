@@ -89,6 +89,10 @@ finally:
     transport.close()
 ```
 
+打开期间发生 `KeyboardInterrupt` 或 worker 启动失败时会回滚资源，并保留原始中断。
+若清理失败，连接保持 faulted 并持有 dispatcher，可再次调用 `close()`；释放完成前不会
+重新打开。关闭失败或被中断不会标记为 closed，清理不会重放运动指令。
+
 `open()` 和 `close()` 幂等。`recover()` 会替换连接、增加连接代次并关闭旧路由，
 不会重放旧代次中的控制帧。恢复后必须重新注册接收路由。
 

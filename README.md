@@ -93,6 +93,12 @@ finally:
 ```
 
 Use `SharedTransportPool` when several devices share the same physical channel.
+Opening also rolls back on `KeyboardInterrupt` or worker startup failure. The
+original interrupt is re-raised. If cleanup fails, the connection stays faulted
+and retains its dispatcher: retry `close()` before opening again. A failed or
+interrupted `close()` never reports the connection as closed. Neither cleanup
+nor recovery automatically replays motion commands.
+
 The first lease opens the transport and the final lease closes it. Recovery
 replaces the connection and never replays messages from an earlier generation.
 

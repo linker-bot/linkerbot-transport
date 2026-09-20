@@ -4,6 +4,10 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Roll back classic CAN bus and worker ownership when thread startup or managed
+  opening is interrupted. Preserve KeyboardInterrupt/SystemExit, retain failed
+  cleanup for explicit close retry, and keep interrupted close faulted.
+
 - Add `TransmitArbiter.submit_fifo_batch()` with all-or-none, frame-counted
   admission and non-interleaved dispatch. `BatchSendReceipt` exposes successful
   frame progress even after failure. Optional pending-age admission and
