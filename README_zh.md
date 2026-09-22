@@ -98,6 +98,9 @@ finally:
 
 多个设备共用同一个物理通道时，使用 `SharedTransportPool`。第一个 lease 打开
 Transport，最后一个 lease 关闭 Transport，从而避免重复建立总线连接。
+如果打开或最后一次关闭失败且清理未完成，池保留该 Transport，租约数为零。
+后续同 key 的 `acquire()` 会先恢复原对象，不会调用新的 factory 绕过清理。
+打开失败后若已完成清理，则 `active_keys()` 不保留该条目。
 
 ## 精确接收路由
 

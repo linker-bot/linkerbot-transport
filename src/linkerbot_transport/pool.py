@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from .contracts import TransportLifecycle
 from .errors import ClosedError, ValidationError
 
 TransportT = TypeVar("TransportT", bound=TransportLifecycle)
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -64,7 +66,10 @@ class SharedTransportPool(Generic[TransportT]):
 
     Factories must construct transports without opening physical resources.
     The pool serializes factory, open and final close operations so an acquire
-    cannot overlap the previous connection's shutdown.
+    cannot overlap the previous connection's shutdown. Failed opens are closed
+    before their entries are removed. If cleanup also fails, the pool retains
+    the transport without issuing a lease; a later acquire recovers that same
+    object before any caller can use the channel again.
     """
 
     def __init__(self) -> None:
@@ -87,9 +92,27 @@ class SharedTransportPool(Generic[TransportT]):
             entry = self._entries.get(key)
             if entry is None:
                 transport = factory()
-                transport.open()
                 entry = _PoolEntry(transport=transport, leases=0)
                 self._entries[key] = entry
+                try:
+                    transport.open()
+                except BaseException as open_error:
+                    try:
+                        transport.close()
+                    except BaseException as cleanup_error:
+                        _LOGGER.warning(
+                            "transport cleanup after pool open failure failed: %s",
+                            cleanup_error,
+                        )
+                        # Keep ownership even when cleanup is interrupted. A
+                        # user interrupt must not become an ordinary open error.
+                        if isinstance(open_error, Exception) and not isinstance(
+                            cleanup_error, Exception
+                        ):
+                            raise
+                    else:
+                        del self._entries[key]
+                    raise
             elif entry.leases == 0:
                 entry.transport.recover()
             entry.leases += 1

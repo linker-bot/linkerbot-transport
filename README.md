@@ -101,6 +101,10 @@ nor recovery automatically replays motion commands.
 
 The first lease opens the transport and the final lease closes it. Recovery
 replaces the connection and never replays messages from an earlier generation.
+If opening or final closing fails and cleanup remains incomplete, the pool
+retains the transport with zero leases. The next `acquire()` for that key
+recovers the retained object instead of invoking another factory. Failed opens
+that are fully cleaned up leave no entry in `active_keys()`.
 
 Modern CAN and CAN FD transports receive through exact, exclusive routes rather
 than broadcast callbacks. The RX thread extracts one key and performs one hash

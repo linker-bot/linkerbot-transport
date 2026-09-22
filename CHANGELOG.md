@@ -4,6 +4,11 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Retain shared-pool ownership when the first transport open and its cleanup
+  both fail. Subsequent acquisition recovers the same zero-lease transport
+  before granting access, preventing duplicate physical connections. Remove
+  failed entries only after successful cleanup and preserve lifecycle interrupts.
+
 - Roll back classic CAN bus and worker ownership when thread startup or managed
   opening is interrupted. Preserve KeyboardInterrupt/SystemExit, retain failed
   cleanup for explicit close retry, and keep interrupted close faulted.
