@@ -190,6 +190,8 @@ class CANFDBackend(Protocol):
       ``HCanbus.dll``, the original backend used by L30 and O20.
     - ``SocketCANFDBackend`` (``socketcan_backend.py``) — Linux SocketCAN in
       CAN FD mode via python-can.
+    - ``PythonCANFDBackend`` (``python_can_backend.py``) — python-can backends,
+      including SLCAN with CANable 2.0 FD extensions.
 
     Tests can pass a hand-rolled fake satisfying this protocol; isinstance
     checks work because the protocol is ``@runtime_checkable``.

@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import can
+
 from linkerbot_transport._managed import DispatcherFactory, ManagedMessageTransport
+from linkerbot_transport._python_can import BusOption, positive_int
 from linkerbot_transport.errors import ValidationError
 from linkerbot_transport.routing import CANRouteKey
 
 from .dispatcher import DEFAULT_MAX_CONSECUTIVE_ERRORS, CANFDMessageDispatcher
+from .python_can_backend import (
+    PythonCANFDBackend,
+    resolve_fd_options,
+    restore_fd_timing,
+)
 from .socketcan_backend import (
     DEFAULT_DATA_BITRATE,
     DEFAULT_NOMINAL_BITRATE,
@@ -110,6 +118,113 @@ class SocketCANFDTransportKey:
     receive_own_messages: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PythonCANFDTransportKey:
+    """Immutable python-can channel settings, including serial and bit timing."""
+
+    channel: str
+    interface: str
+    bitrate: int
+    data_bitrate: int
+    fd: bool
+    receive_own_messages: bool
+    bus_options: tuple[tuple[str, BusOption], ...]
+    timing: tuple[tuple[str, int], ...]
+
+
+class PythonCANFDTransport(ManagedMessageTransport[CANFDMessage]):
+    """Explicit-lifecycle CAN FD via python-can (SLCAN, SocketCAN, PCAN, etc.).
+
+    SLCAN requires CANable 2.0 FD extensions and the serial dependency. Its
+    nominal/data bitrates are translated into BitTimingFd for python-can.
+    ``bus_options`` accepts immutable scalar driver settings such as
+    ``tty_baudrate``. Explicit timing is copied; it must match both bitrates.
+    """
+
+    def __init__(
+        self,
+        channel: str,
+        interface: str,
+        *,
+        bitrate: int = DEFAULT_NOMINAL_BITRATE,
+        data_bitrate: int = DEFAULT_DATA_BITRATE,
+        fd: bool = True,
+        receive_own_messages: bool = False,
+        bus_options: Mapping[str, BusOption] | None = None,
+        timing: can.BitTimingFd | None = None,
+        max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
+        dispatcher_factory: DispatcherFactory[CANFDMessage] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        positive_int(max_consecutive_errors, "max_consecutive_errors")
+        channel, options, timing_values = resolve_fd_options(
+            channel,
+            interface,
+            bitrate,
+            data_bitrate,
+            fd,
+            receive_own_messages,
+            bus_options,
+            timing,
+        )
+        self._key = PythonCANFDTransportKey(
+            channel,
+            interface,
+            bitrate,
+            data_bitrate,
+            fd,
+            receive_own_messages,
+            options,
+            timing_values,
+        )
+        if dispatcher_factory is None:
+
+            def create(
+                on_bus_error: Callable[[Exception], None],
+            ) -> CANFDMessageDispatcher:
+                resolved_timing = restore_fd_timing(timing_values)
+                if interface == "socketcan":
+                    backend = SocketCANFDBackend(
+                        channel,
+                        bitrate=bitrate,
+                        data_bitrate=data_bitrate,
+                        fd=fd,
+                        receive_own_messages=receive_own_messages,
+                        bus_options=dict(options),
+                        timing=resolved_timing,
+                    )
+                else:
+                    backend = PythonCANFDBackend(
+                        channel,
+                        interface,
+                        bitrate=bitrate,
+                        data_bitrate=data_bitrate,
+                        fd=fd,
+                        receive_own_messages=receive_own_messages,
+                        bus_options=dict(options),
+                        timing=resolved_timing,
+                    )
+                return CANFDMessageDispatcher(
+                    interface=backend,
+                    on_bus_error=on_bus_error,
+                    max_consecutive_errors=max_consecutive_errors,
+                )
+
+            resolved_factory: DispatcherFactory[CANFDMessage] = create
+        else:
+            resolved_factory = dispatcher_factory
+        super().__init__(
+            resolved_factory,
+            _canfd_route_key,
+            data_size_of=_canfd_data_size,
+            monotonic=monotonic,
+        )
+
+    @property
+    def pool_key(self) -> PythonCANFDTransportKey:
+        return self._key
+
+
 class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
     """SocketCAN FD transport whose constructor performs no link or bus I/O."""
 
@@ -164,15 +279,11 @@ class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
                     auto_reconfigure=auto_reconfigure,
                     receive_own_messages=receive_own_messages,
                 )
-                try:
-                    return CANFDMessageDispatcher(
-                        interface=backend,
-                        on_bus_error=on_bus_error,
-                        max_consecutive_errors=max_consecutive_errors,
-                    )
-                except Exception:
-                    backend.close()
-                    raise
+                return CANFDMessageDispatcher(
+                    interface=backend,
+                    on_bus_error=on_bus_error,
+                    max_consecutive_errors=max_consecutive_errors,
+                )
 
             resolved_factory: DispatcherFactory[CANFDMessage] = create
         else:
@@ -204,6 +315,8 @@ def _canfd_data_size(message: CANFDMessage) -> int:
 __all__ = [
     "CANFDTransport",
     "CANFDTransportKey",
+    "PythonCANFDTransport",
+    "PythonCANFDTransportKey",
     "SocketCANFDTransport",
     "SocketCANFDTransportKey",
 ]

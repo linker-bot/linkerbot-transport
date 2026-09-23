@@ -4,6 +4,8 @@ from linkerbot_transport.routing import CANRouteKey, RoutedMessage, RouteSubscri
 from .transport import (
     CANFDTransport,
     CANFDTransportKey,
+    PythonCANFDTransport,
+    PythonCANFDTransportKey,
     SocketCANFDTransport,
     SocketCANFDTransportKey,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "CANRouteKey",
     "CANFDTransport",
     "CANFDTransportKey",
+    "PythonCANFDTransport",
+    "PythonCANFDTransportKey",
     "RouteSubscription",
     "RoutedMessage",
     "SendOutcome",

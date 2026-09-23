@@ -2,12 +2,20 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import can
 
+from linkerbot_transport._python_can import (
+    BusOption,
+    ChannelClaim,
+    freeze_bus_options,
+    positive_int,
+    validate_channel,
+)
 from linkerbot_transport.errors import (
     ClosedError,
     LinkerbotError,
@@ -65,6 +73,9 @@ class CANMessageDispatcher:
         max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
         *,
         start_send_worker: bool = True,
+        bitrate: int = 1_000_000,
+        receive_own_messages: bool = False,
+        bus_options: Mapping[str, BusOption] | None = None,
     ) -> None:
         """Initialize the CAN message dispatcher.
 
@@ -85,10 +96,15 @@ class CANMessageDispatcher:
 
         if not isinstance(start_send_worker, bool):
             raise ValidationError("start_send_worker must be bool")
+        validate_channel(interface_name, interface_type)
+        positive_int(bitrate, "bitrate")
+        if not isinstance(receive_own_messages, bool):
+            raise ValidationError("receive_own_messages must be bool")
+        options = freeze_bus_options(bus_options)
         self._can_interface = CanInterface(
             interface_name=interface_name, interface_type=interface_type
         )
-        self._bitrate = 1_000_000
+        self._bitrate = bitrate
         self._subscribers: list[Callable[[can.Message], None]] = []
         self._subscribers_lock = threading.Lock()
         self._running = True
@@ -113,9 +129,25 @@ class CANMessageDispatcher:
             target=self._send_loop, daemon=True, name="CANMessageDispatcher.send_loop"
         )
         # Set up all cleanup state before acquiring the physical resource.
-        self._bus: can.BusABC = can.Bus(
-            channel=interface_name, interface=interface_type, bitrate=self._bitrate
+        self._channel_claim = ChannelClaim(
+            interface_type,
+            interface_name,
+            (bitrate, None, False, receive_own_messages, options, ()),
         )
+        try:
+            backend_options: dict[str, Any] = dict(options)
+            self._bus: can.BusABC = can.Bus(
+                channel=interface_name,
+                interface=interface_type,
+                bitrate=bitrate,
+                fd=False,
+                receive_own_messages=receive_own_messages,
+                ignore_config=True,
+                **backend_options,
+            )
+        except BaseException:
+            self._channel_claim.release()
+            raise
         try:
             self._recv_thread.start()
             if start_send_worker:
@@ -130,7 +162,7 @@ class CANMessageDispatcher:
                 )
                 # ManagedMessageTransport can retain this otherwise unreturned
                 # object. Preserve the original exception, including Ctrl+C.
-                error._failed_dispatcher = self
+                setattr(error, "_failed_dispatcher", self)
             raise
 
     @property
@@ -405,6 +437,7 @@ class CANMessageDispatcher:
             except Exception as error:
                 return TransportError(f"CAN bus shutdown failed: {error}", cause=error)
             self._shutdown_complete = True
+            self._channel_claim.release()
             return None
 
     def _shutdown_bus_after_transmit_drain(self) -> LinkerbotError | None:

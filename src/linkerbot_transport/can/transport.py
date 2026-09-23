@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import can
 
 from linkerbot_transport._managed import DispatcherFactory, ManagedMessageTransport
+from linkerbot_transport._python_can import (
+    BusOption,
+    freeze_bus_options,
+    positive_int,
+    validate_channel,
+)
 from linkerbot_transport.errors import ValidationError
 from linkerbot_transport.routing import CANRouteKey
 
@@ -23,6 +29,9 @@ class CANTransportKey:
     interface_name: str
     interface_type: str = "socketcan"
     routing_identity: int | None = None
+    bitrate: int = 1_000_000
+    receive_own_messages: bool = False
+    bus_options: tuple[tuple[str, BusOption], ...] = ()
 
 
 class CANTransport(ManagedMessageTransport[can.Message]):
@@ -40,15 +49,19 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         interface_name: str,
         interface_type: str = "socketcan",
         *,
+        bitrate: int = 1_000_000,
+        receive_own_messages: bool = False,
+        bus_options: Mapping[str, BusOption] | None = None,
         max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
         dispatcher_factory: DispatcherFactory[can.Message] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         route_key_of: Callable[[can.Message], CANRouteKey] | None = None,
     ) -> None:
-        if not isinstance(interface_name, str) or not interface_name:
-            raise ValidationError("interface_name must be a non-empty string")
-        if not isinstance(interface_type, str) or not interface_type:
-            raise ValidationError("interface_type must be a non-empty string")
+        validate_channel(interface_name, interface_type)
+        positive_int(bitrate, "bitrate")
+        if not isinstance(receive_own_messages, bool):
+            raise ValidationError("receive_own_messages must be bool")
+        options = freeze_bus_options(bus_options)
         if (
             not isinstance(max_consecutive_errors, int)
             or isinstance(max_consecutive_errors, bool)
@@ -62,6 +75,9 @@ class CANTransport(ManagedMessageTransport[can.Message]):
             interface_name,
             interface_type,
             None if route_key_of is None else id(route_key_of),
+            bitrate,
+            receive_own_messages,
+            options,
         )
 
         if dispatcher_factory is None:
@@ -75,6 +91,9 @@ class CANTransport(ManagedMessageTransport[can.Message]):
                     on_bus_error=on_bus_error,
                     max_consecutive_errors=max_consecutive_errors,
                     start_send_worker=False,
+                    bitrate=bitrate,
+                    receive_own_messages=receive_own_messages,
+                    bus_options=dict(options),
                 )
 
             resolved_factory: DispatcherFactory[can.Message] = create

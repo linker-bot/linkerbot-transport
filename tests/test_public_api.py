@@ -83,6 +83,8 @@ CANFD_EXPORTS = {
     "SendReceipt",
     "SendResult",
     "SocketCANFDTransport",
+    "PythonCANFDTransport",
+    "PythonCANFDTransportKey",
     "SocketCANFDTransportKey",
     "dlc_to_length",
     "length_to_dlc",

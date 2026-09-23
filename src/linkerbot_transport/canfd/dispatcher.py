@@ -139,8 +139,18 @@ class CANFDMessageDispatcher:
         self._send_thread = threading.Thread(
             target=self._send_loop, daemon=True, name="CANFDMessageDispatcher.send_loop"
         )
-        self._recv_thread.start()
-        self._send_thread.start()
+        try:
+            self._recv_thread.start()
+            self._send_thread.start()
+        except BaseException as error:
+            try:
+                CANFDMessageDispatcher.stop(self)
+            except BaseException:
+                self._logger.exception(
+                    "CAN FD startup rollback failed; cleanup must retry"
+                )
+                setattr(error, "_failed_dispatcher", self)
+            raise
 
     @property
     def interface(self) -> CANFDBackend:

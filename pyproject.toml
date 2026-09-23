@@ -27,8 +27,8 @@ Repository = "https://gitea.linkerhub.work/zhuzhixiang/linkerbot-transport"
 
 [project.optional-dependencies]
 can = ["python-can>=4.6.1,<5.0"]
-canfd = ["python-can>=4.6.1,<5.0"]
-all = ["python-can>=4.6.1,<5.0"]
+canfd = ["python-can[serial]>=4.6.1,<5.0"]
+all = ["python-can[serial]>=4.6.1,<5.0"]
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]

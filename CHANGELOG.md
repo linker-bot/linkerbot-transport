@@ -4,6 +4,17 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add `PythonCANFDTransport` for python-can CAN FD backends and CANable 2.0
+  SLCAN FD. Snapshot serial/bit-timing configuration, include pyserial in FD
+  extras, and share DLC/FD/BRS conversion with Linux SocketCAN FD. Keep remote
+  and error frames out of device payloads and preserve receive timestamps in
+  microseconds. Roll back FD worker startup failures with retryable cleanup.
+
+- Configure classic CAN bitrate, local echoes and immutable python-can backend
+  options, including Windows PCAN. Ignore ambient driver configuration and
+  reject conflicting live channel settings before opening another handle.
+  Retain channel ownership until failed shutdown has been cleaned up.
+
 - Retain shared-pool ownership when the first transport open and its cleanup
   both fail. Subsequent acquisition recovers the same zero-lease transport
   before granting access, preventing duplicate physical connections. Remove

@@ -36,6 +36,74 @@ python -m pip install \
 
 ## Public API
 
+### Windows PCAN / classic CAN
+
+Install PEAK's PCAN driver and PCAN-Basic matching the Python process
+architecture, then use the `can` extra. No Linux network interface is needed:
+
+```python
+from linkerbot_transport.can import CANTransport
+
+transport = CANTransport(
+    "PCAN_USBBUS1", "pcan", bitrate=1_000_000,
+    bus_options={"auto_reset": True},
+)
+transport.open()
+try:
+    health = transport.get_health()
+finally:
+    transport.close()
+```
+
+`CANTransport("can0")` continues to use python-can's Linux SocketCAN backend.
+The Linux link bitrate is configured externally; passing `bitrate` does not
+change an existing kernel link. Construction performs no device I/O. Driver
+loading happens in `open()` and failures retain their original cause.
+
+`bitrate`, `receive_own_messages` and scalar `bus_options` are copied into the
+connection key. Options must be strings, numbers, booleans or `None`; use named
+parameters for channel, interface and bitrate. PCAN's `device_id` override is
+rejected: select an explicit channel so its identity remains stable. Ambient
+python-can config files and environment settings are ignored. Conflicting
+settings for an already-open channel in this process fail before a second
+driver open. Use `SharedTransportPool` with `transport.pool_key` to share
+identical connections; this does not lock out other processes.
+
+Virtual-bus and driver-stub tests cover configuration, routing, recovery and
+cleanup. They do not establish Windows hardware compatibility or achievable
+control rates; those require the target PCAN adapter and Windows driver.
+
+### CAN FD via python-can / SLCAN
+
+The source checkout adds `PythonCANFDTransport` (not yet in release 1.0.0).
+Install it with `python -m pip install -e ".[canfd]"`; the extra includes
+pyserial. On Windows, use an explicit COM port and firmware implementing the
+CANable 2.0 SLCAN FD extensions:
+
+```python
+from linkerbot_transport.canfd import PythonCANFDTransport
+
+transport = PythonCANFDTransport(
+    "COM5", "slcan", bitrate=1_000_000, data_bitrate=5_000_000,
+    bus_options={"tty_baudrate": 1_000_000},
+)
+```
+
+The same lifecycle, routes, `CANFDMessage` and send receipts apply. `0x04`
+means FD without BRS; set `frame_type=0x0C` for BRS. SLCAN translates the two
+rates into python-can's `BitTimingFd`; its current data-rate choices are 2 and
+5 Mbit/s. Ordinary classic-only SLCAN firmware cannot carry FD frames.
+Serial baudrate is separate from CAN bitrate and does not promise a polling
+rate. See [backend configuration and Windows validation](docs/python-can.md).
+
+`SocketCANFDTransport` keeps its Linux link validation/reconfiguration and
+shares the python-can frame conversion. `PythonCANFDTransport(...,
+"socketcan")` also validates the preconfigured link, without reconfiguring it.
+These paths use one receive worker and direct sends, with no extra forwarding
+thread added by the adapter. The existing internal FD queue worker is retained.
+
+### Lifecycle and routing
+
 Only the `linkerbot_transport` namespace is public. Classic CAN and CAN FD
 applications construct an explicit-lifecycle transport:
 

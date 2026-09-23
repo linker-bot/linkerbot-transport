@@ -34,6 +34,66 @@ python -m pip install \
 
 ## 公共 API
 
+### Windows PCAN / 经典 CAN
+
+安装 PEAK 的 PCAN 驱动与匹配 Python 进程位数的 PCAN-Basic，并安装本包的
+`can` extra。直接指定 PCAN 通道，无需 Linux 网络接口：
+
+```python
+from linkerbot_transport.can import CANTransport
+
+transport = CANTransport(
+    "PCAN_USBBUS1", "pcan", bitrate=1_000_000,
+    bus_options={"auto_reset": True},
+)
+transport.open()
+try:
+    health = transport.get_health()
+finally:
+    transport.close()
+```
+
+`CANTransport("can0")` 继续使用 python-can 的 Linux SocketCAN 后端。
+Linux 链路速率由系统配置，`bitrate` 参数不会重新配置现有内核接口。
+构造阶段不进行设备 I/O，驱动在 `open()` 时加载，失败保留原始异常原因。
+
+`bitrate`、`receive_own_messages` 和 `bus_options` 的快照都会进入连接键。
+后端选项仅接受字符串、数字、布尔值或 `None`；通道、后端和波特率使用具名参数。
+不接受会重写通道的 PCAN `device_id`，请明确选择通道。忽略 python-can 的环境变量
+和配置文件，避免运行参数与连接键不一致。同一进程中已打开通道的配置冲突会在再次
+打开驱动前报错。相同配置使用 `SharedTransportPool` 配合 `transport.pool_key`
+复用连接；这不是跨进程锁。
+
+虚拟总线和驱动桩测试覆盖参数、路由、恢复和清理。Windows 实机兼容性和控制频率
+仍需在目标 PCAN 适配器及 Windows 驱动上验收。
+
+### python-can / SLCAN CAN FD
+
+当前源码新增 `PythonCANFDTransport`（尚未包含在 1.0.0 发布包中）。使用
+`python -m pip install -e ".[canfd]"` 安装，extra 包含 pyserial。
+Windows 指定 COM 口；适配器固件须实现 CANable 2.0 的 SLCAN FD 扩展：
+
+```python
+from linkerbot_transport.canfd import PythonCANFDTransport
+
+transport = PythonCANFDTransport(
+    "COM5", "slcan", bitrate=1_000_000, data_bitrate=5_000_000,
+    bus_options={"tty_baudrate": 1_000_000},
+)
+```
+
+沿用相同的生命周期、路由、`CANFDMessage` 与发送回执。`0x04` 表示 FD 不开 BRS，
+需要 BRS 时显式设置 `frame_type=0x0C`。SLCAN 会把双速率转换为 python-can 所需的
+`BitTimingFd`，目前数据速率支持 2 / 5 Mbps。普通仅支持经典 CAN 的 SLCAN 固件无法
+收发 FD。串口波特率与 CAN 速率不同，也不等于可达到的轮询频率。
+完整配置和验收步骤见 [python-can 后端说明](docs/python-can.md)。
+
+`SocketCANFDTransport` 保留 Linux 链路校验和显式重新配置，共用帧转换实现。
+`PythonCANFDTransport(..., "socketcan")` 同样校验已有链路，不自动修改接口。
+适配层不增加转发线程，保留现有的接收线程、内部 FD 队列线程和公共同步发送路径。
+
+### 生命周期与路由
+
 唯一公共命名空间是 `linkerbot_transport`。经典 CAN 和 CAN FD 应用都应构造
 具有显式生命周期的 Transport：
 

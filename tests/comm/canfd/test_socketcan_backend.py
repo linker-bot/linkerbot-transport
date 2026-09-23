@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest import mock
 
+import can
 import pytest
 
 from linkerbot_transport.canfd import (
@@ -61,7 +62,7 @@ def _link_show_payload(
 def fake_can_bus():
     """Stub ``can.Bus`` so SocketCANFDBackend.__init__ does not open a real socket."""
     with mock.patch(
-        "linkerbot_transport.canfd.socketcan_backend.can.Bus", autospec=True
+        "linkerbot_transport.canfd.python_can_backend.can.Bus", autospec=True
     ) as bus_cls:
         instance = mock.MagicMock()
         bus_cls.return_value = instance
@@ -357,12 +358,13 @@ def test_receive_translates_python_can_messages_back(
     fake_can_bus, with_ip_present, link_show
 ) -> None:
     link_show.show_response = _link_show_proc(returncode=0, stdout=_link_show_payload())
-    incoming = mock.MagicMock()
-    incoming.arbitration_id = 0x456
-    incoming.is_extended_id = True
-    incoming.is_fd = True
-    incoming.bitrate_switch = False
-    incoming.data = b"\xaa\xbb\xcc"
+    incoming = can.Message(
+        arbitration_id=0x456,
+        is_extended_id=True,
+        is_fd=True,
+        data=b"\xaa\xbb\xcc",
+        check=True,
+    )
     pending = [incoming]
 
     def fake_recv(timeout: float):
@@ -398,7 +400,9 @@ def test_receive_blocks_first_frame_then_drains_with_zero_timeout(
 
     timeouts_seen: list[float] = []
     msgs = [
-        mock.MagicMock(arbitration_id=0x10 + i, is_extended_id=False, data=b"\x00")
+        can.Message(
+            arbitration_id=0x10 + i, is_extended_id=False, data=b"\x00", check=True
+        )
         for i in range(2)
     ]
 
@@ -442,7 +446,7 @@ def test_receive_zero_timeout_performs_one_nonblocking_poll(
     fake_can_bus, with_ip_present, link_show
 ) -> None:
     link_show.show_response = _link_show_proc(returncode=0, stdout=_link_show_payload())
-    incoming = mock.MagicMock(
+    incoming = can.Message(
         arbitration_id=0x456,
         is_extended_id=True,
         is_fd=True,
