@@ -1,5 +1,9 @@
 # linkerbot-transport
 
+The source checkout provides PCAN/SLCAN channel enumeration with explicit driver
+diagnostics. See [adapter enumeration](docs/adapter-enumeration.md) for candidate
+selection and firmware capability limits.
+
 [English](README.md) |
 [简体中文](https://gitea.linkerhub.work/zhuzhixiang/linkerbot-transport/src/branch/main/README_zh.md)
 

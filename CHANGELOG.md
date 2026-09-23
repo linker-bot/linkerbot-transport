@@ -4,6 +4,12 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add public PCAN and SLCAN candidate enumeration with immutable native channel
+  descriptors and explicit dependency, driver, busy and missing-port diagnostics.
+  Query PCAN through python-can without initializing channels; select only known
+  CANable USB candidates or explicitly requested serial ports without opening
+  them. Keep SLCAN FD firmware capability unknown until protocol validation.
+
 - Report MiniCANFD library Exit failures from close and retain explicit cleanup
   retries. Release each lifecycle reference once, so an old close retry cannot
   tear down a new connection or close an already released channel again.

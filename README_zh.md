@@ -1,5 +1,8 @@
 # linkerbot-transport
 
+当前源码提供 PCAN/SLCAN 通道枚举及明确的驱动诊断，见
+[适配器枚举说明](docs/adapter-enumeration.md)。串口候选与 FD 固件能力分别判断。
+
 [English](https://gitea.linkerhub.work/zhuzhixiang/linkerbot-transport/src/branch/main/README.md) |
 [简体中文](README_zh.md)
 
