@@ -110,6 +110,23 @@ def test_slcan_constructor_does_not_touch_serial_and_normalizes_baudrate():
     assert one.pool_key == two.pool_key
 
 
+def test_slcan_parser_error_preserves_previous_valid_reply(monkeypatch):
+    import serial
+
+    port = SerialEndpoint()
+    monkeypatch.setattr(serial, "serial_for_url", lambda *args, **kwargs: port)
+    backend = PythonCANFDBackend("COM5", "slcan", bus_options={"sleep_after_open": 0})
+    try:
+        port.incoming.extend(b"d1231AA\rd1231ZZ\rd1231BB\r")
+        assert [frame.data for frame in backend.receive(timeout_ms=0)] == [b"\xaa"]
+        with pytest.raises(ValueError):
+            backend.receive(timeout_ms=0)
+        assert [frame.data for frame in backend.receive(timeout_ms=0)] == [b"\xbb"]
+        assert backend.receive(timeout_ms=0) == []
+    finally:
+        backend.close()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

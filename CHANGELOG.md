@@ -4,6 +4,12 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Preserve valid frames received before a later error in python-can CAN FD
+  batches, including SocketCAN FD. Return the valid prefix, then report the
+  pending receive/conversion error once before reading further frames. Keep
+  error causes, immediate interrupts, and existing consecutive-error handling;
+  discard pending errors on successful close.
+
 - Track PCAN initialization ownership before later driver configuration can fail.
   Roll back only channels acquired by that instance, check Uninitialize results,
   and release Windows receive events after native shutdown. Keep failed cleanup

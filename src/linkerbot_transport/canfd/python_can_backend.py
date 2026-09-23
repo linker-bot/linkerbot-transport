@@ -143,6 +143,7 @@ class PythonCANFDBackend:
         self._interface = interface
         self._lock = threading.Lock()
         self._closed = False
+        self._pending_receive_error: Exception | None = None
         self._claim = ChannelClaim(
             interface,
             channel,
@@ -232,30 +233,45 @@ class PythonCANFDBackend:
             ) from error
 
     def receive(self, max_frames: int = 64, timeout_ms: int = 10) -> list[CANFDMessage]:
+        """Deliver valid frames before reporting a later batch error on the next call."""
         if self._closed:
             raise TransportError("python-can FD backend is closed")
         positive_int(max_frames, "max_frames")
         if timeout_ms < 0:
             raise ValidationError("timeout_ms must be non-negative")
+        if self._pending_receive_error is not None:
+            error = self._pending_receive_error
+            self._pending_receive_error = None
+            raise error
         result = []
         # One blocking wait followed by a bounded, nonblocking drain. Remote
         # frames have no device payload; bus errors must not look like replies.
-        for index in range(max_frames):
-            try:
-                message = self._bus.recv(timeout=timeout_ms / 1000 if index == 0 else 0)
-            except (can.CanError, OSError) as error:
-                raise TransportError(
-                    f"{self._interface} CAN FD receive failed: {error}", cause=error
-                ) from error
-            if message is None:
-                break
-            if message.is_error_frame:
-                raise TransportError(
-                    f"{self._interface} reported a CAN bus error frame"
-                )
-            if message.is_remote_frame:
-                continue
-            result.append(_to_canfd_message(message))
+        try:
+            for index in range(max_frames):
+                try:
+                    message = self._bus.recv(
+                        timeout=timeout_ms / 1000 if index == 0 else 0
+                    )
+                except (can.CanError, OSError) as error:
+                    raise TransportError(
+                        f"{self._interface} CAN FD receive failed: {error}", cause=error
+                    ) from error
+                if message is None:
+                    break
+                if message.is_error_frame:
+                    raise TransportError(
+                        f"{self._interface} reported a CAN bus error frame"
+                    )
+                if message.is_remote_frame:
+                    continue
+                result.append(_to_canfd_message(message))
+        except Exception as error:
+            if not result:
+                raise
+            # These frames have already left the driver queue. Deliver them,
+            # then report this same error before reading any newer frames.
+            # Include parser/conversion failures; process interrupts propagate.
+            self._pending_receive_error = error
         return result
 
     def close(self) -> None:
@@ -272,6 +288,7 @@ class PythonCANFDBackend:
                 ) from error
             # Interrupted or failed shutdown keeps both the handle and claim.
             self._closed = True
+            self._pending_receive_error = None
             self._claim.release()
 
 

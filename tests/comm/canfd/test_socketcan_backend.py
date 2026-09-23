@@ -425,6 +425,28 @@ def test_receive_blocks_first_frame_then_drains_with_zero_timeout(
     assert timeouts_seen[1:] == [0, 0]
 
 
+def test_receive_preserves_data_before_bus_error(
+    fake_can_bus, with_ip_present, link_show
+) -> None:
+    link_show.show_response = _link_show_proc(returncode=0, stdout=_link_show_payload())
+    fake_can_bus.recv.side_effect = [
+        can.Message(arbitration_id=0x123, is_fd=True, data=b"a"),
+        can.Message(is_error_frame=True),
+        can.Message(arbitration_id=0x123, is_fd=True, data=b"b"),
+        None,
+    ]
+    backend = SocketCANFDBackend(channel="can0")
+    try:
+        assert [frame.data for frame in backend.receive()] == [b"a"]
+        assert fake_can_bus.recv.call_count == 2
+        with pytest.raises(TransportError, match="socketcan.*error frame"):
+            backend.receive()
+        assert fake_can_bus.recv.call_count == 2
+        assert [frame.data for frame in backend.receive()] == [b"b"]
+    finally:
+        backend.close()
+
+
 def test_receive_returns_empty_when_no_frame_arrives_in_window(
     fake_can_bus, with_ip_present, link_show
 ) -> None:
