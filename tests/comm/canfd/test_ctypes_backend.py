@@ -1,4 +1,5 @@
 import ctypes
+import os
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -303,23 +304,25 @@ def test_read_dev_info_decodes_strings(monkeypatch: pytest.MonkeyPatch) -> None:
     }
 
 
-def test_library_candidates_prefer_explicit_env_then_system_loader(
+def test_library_candidates_use_explicit_or_env_without_silent_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LINKERBOT_CANFD_LIB", "/env/libcanbus.so")
 
     candidates = backend._library_candidates(Path("/explicit/libcanbus.so"))
 
-    assert candidates[0] == Path("/explicit/libcanbus.so")
-    assert candidates[1] == Path("/env/libcanbus.so")
-    assert candidates[2] == backend._default_library_name()
+    assert candidates == [Path("/explicit/libcanbus.so")]
+    assert backend._library_candidates(None) == [Path("/env/libcanbus.so")]
 
 
 def test_library_candidates_default_to_system_loader() -> None:
     candidates = backend._library_candidates(None)
 
     assert candidates[0] == backend._default_library_name()
-    assert any(str(candidate).endswith("hand/libcanbus.so") for candidate in candidates)
+    assert any(
+        Path(candidate).parts[-2:] == ("hand", "libcanbus.so")
+        for candidate in candidates
+    )
 
 
 def test_load_library_error_mentions_configuration(
@@ -374,7 +377,12 @@ def test_library_cache_merges_symlink_with_real_path(
     real_path = tmp_path / "libcanbus.so.1"
     alias_path = tmp_path / "libcanbus.so"
     real_path.touch()
-    alias_path.symlink_to(real_path)
+    try:
+        alias_path.symlink_to(real_path)
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("Windows runner does not allow symlink creation")
+        raise
     loaded: list[object] = []
 
     def load(candidate: str) -> object:

@@ -6,9 +6,10 @@ The vendor library documents two process-level entry points in
 - ``LibCANbus_Init`` allocates global system resources.
 - ``LibCANbus_Exit`` releases them and explicitly "prevents memory leaks".
 
-While one or more ``CANFDInterface`` instances are open, these entry points
-must be called as one shared Init/Exit pair per loaded ``.so``/``.dll``. This
-module keeps that vendor lifecycle reference count separate from the operating
+On Linux, while one or more ``CANFDInterface`` instances are open, these entry points
+must be called as one shared Init/Exit pair per loaded ``.so``. Windows HCanbus.dll
+has no Init/Exit exports and addresses each enumerated channel with one devNum.
+This module keeps that vendor lifecycle reference count separate from the operating
 system handle lifetime: loaded main-library and Linux dependency handles are
 cached strongly for the rest of the process and are never explicitly unloaded.
 
@@ -33,6 +34,7 @@ from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
 CANFD_DEFAULT_SEND_TIMEOUT_MS = 10
 CANFD_DEFAULT_RECEIVE_TIMEOUT_MS = 10
 CANFD_DEFAULT_MAX_RECEIVE_FRAMES = 64
+CANFD_MAX_RECEIVE_FRAMES = 2500
 CANFD_TRANSMIT_FRAME_COUNT = 1
 # Vendor PDF §3.22: CANFD_Transmit's items parameter caps at 100 frames per
 # call. We preallocate a buffer of this size so the batch path never has to
@@ -56,6 +58,7 @@ _logger = logging.getLogger(__name__)
 
 _library_load_lock = threading.Lock()
 _library_handle_cache: dict[str, Any] = {}
+_dll_directory_handles: dict[str, Any] = {}
 _dependency_load_lock = threading.Lock()
 _dependency_preload_attempted: set[str] = set()
 _dependency_handle_cache: dict[str, Any] = {}
@@ -262,19 +265,34 @@ class CANFDInterface:
     ) -> None:
         """Open and initialize a CANFD adapter channel.
 
-        On success, holds a reference count on the vendor library so
-        ``LibCANbus_Init`` runs exactly once per process and ``LibCANbus_Exit``
-        runs exactly once after every interface is closed. If any step after
-        the library is loaded fails, the refcount is released so partial
-        initialization does not leak vendor resources.
+        Linux holds an Init/Exit reference while open. Windows uses the DLL's
+        own process lifecycle. A failed initialization closes its channel; if
+        cleanup also fails, the exception retains the interface for managed
+        close/recover instead of releasing ownership prematurely.
         """
-        if device_index < 0:
-            raise ValidationError("device_index must be non-negative")
-        if channel_index < 0:
-            raise ValidationError("channel_index must be non-negative")
+        for value, name in (
+            (device_index, "device_index"),
+            (channel_index, "channel_index"),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 0xFFFFFFFF
+            ):
+                raise ValidationError(f"{name} must be an unsigned 32-bit integer")
+        self._windows = platform.system() == "Windows"
+        if self._windows and channel_index != 0:
+            raise ValidationError(
+                "HCanbus.dll uses one enumerated channel number: set device_index "
+                "to devNum and leave channel_index=0"
+            )
 
         self._device_index = device_index
         self._channel_index = channel_index
+        self._channel_args = (
+            (device_index,) if self._windows else (device_index, channel_index)
+        )
+        self._device_open = False
         self._config = config or CANFDConfigOptions()
         # Independent locks per direction. send and receive run truly
         # concurrently — they only contend at the per-direction lock, which
@@ -294,7 +312,7 @@ class CANFDInterface:
         self._close_complete_event.set()
         self._lifecycle_key: str | None = None
         self._lib = _load_library(library_path)
-        _bind_signatures(self._lib)
+        _bind_signatures(self._lib, windows=self._windows)
         # Hot-path zero-alloc buffers. The TX frame is reused across every
         # send under _tx_lock; the TX batch buffer is reused across every
         # send_batch under the same lock; the RX buffer is reused across
@@ -307,12 +325,18 @@ class CANFDInterface:
         # acquire the vendor lifecycle refcount before any device-level call;
         # release it if anything below this point raises so we don't leak the
         # Init reference on a partially-initialized interface.
-        self._lifecycle_key = _lifecycle_acquire(self._lib)
+        if not self._windows:
+            self._lifecycle_key = _lifecycle_acquire(self._lib)
         try:
             self._open()
-        except BaseException:
-            _lifecycle_release(self._lifecycle_key)
-            self._lifecycle_key = None
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException:
+                _logger.exception(
+                    "CAN FD initialization cleanup failed; close must retry"
+                )
+                setattr(error, "_failed_interface", self)
             raise
 
     @property
@@ -344,27 +368,14 @@ class CANFDInterface:
                 f"found {count} adapter(s)"
             )
 
-        status = self._lib.CAN_OpenDevice(self._device_index, self._channel_index)
+        status = self._lib.CAN_OpenDevice(*self._channel_args)
         if status != CANFD_STATUS_OK:
             raise TransportError(f"CAN_OpenDevice failed with status {status}")
-        try:
-            config = self._build_ctypes_config()
-            status = self._lib.CANFD_Init(
-                self._device_index, self._channel_index, ctypes.byref(config)
-            )
-            if status != CANFD_STATUS_OK:
-                raise TransportError(f"CANFD_Init failed with status {status}")
-        except BaseException:
-            try:
-                self._lib.CAN_CloseDevice(self._device_index, self._channel_index)
-            except Exception as close_error:
-                _logger.warning(
-                    "CAN_CloseDevice failed while rolling back CANFD_Init: %s",
-                    close_error,
-                )
-            finally:
-                self._closed_event.set()
-            raise
+        self._device_open = True
+        config = self._build_ctypes_config()
+        status = self._lib.CANFD_Init(*self._channel_args, ctypes.byref(config))
+        if status != CANFD_STATUS_OK:
+            raise TransportError(f"CANFD_Init failed with status {status}")
 
         # _open is called from __init__ before the object is published.
         self._close_complete_event.set()
@@ -408,8 +419,7 @@ class CANFDInterface:
             self._ensure_open()
             self._fill_tx_frame(message)
             sent = self._lib.CANFD_Transmit(
-                self._device_index,
-                self._channel_index,
+                *self._channel_args,
                 ctypes.byref(self._tx_frame),
                 CANFD_TRANSMIT_FRAME_COUNT,
                 timeout_ms,
@@ -473,8 +483,7 @@ class CANFDInterface:
             for index, message in enumerate(messages):
                 self._fill_frame(self._tx_batch[index], message)
             sent = self._lib.CANFD_Transmit(
-                self._device_index,
-                self._channel_index,
+                *self._channel_args,
                 self._tx_batch,
                 count,
                 timeout_ms,
@@ -501,8 +510,14 @@ class CANFDInterface:
         immutable copies, so callers may keep them after the next receive
         overwrites the buffer.
         """
-        if max_frames <= 0:
-            raise ValidationError("max_frames must be positive")
+        if (
+            not isinstance(max_frames, int)
+            or isinstance(max_frames, bool)
+            or not 1 <= max_frames <= CANFD_MAX_RECEIVE_FRAMES
+        ):
+            raise ValidationError(
+                f"max_frames must be between 1 and {CANFD_MAX_RECEIVE_FRAMES}"
+            )
         if timeout_ms < 0:
             raise ValidationError("timeout_ms must be non-negative")
 
@@ -514,8 +529,7 @@ class CANFDInterface:
             else:
                 buffer = (CanFDMsg * max_frames)()
             received = self._lib.CANFD_Receive(
-                self._device_index,
-                self._channel_index,
+                *self._channel_args,
                 buffer,
                 max_frames,
                 timeout_ms,
@@ -588,17 +602,18 @@ class CANFDInterface:
                     pass
 
                 # Step 3: actually close the vendor side.
-                try:
-                    close_status = self._lib.CAN_CloseDevice(
-                        self._device_index, self._channel_index
-                    )
-                except Exception as error:
-                    raise TransportError(f"CAN_CloseDevice failed: {error}") from error
-
-                if close_status != CANFD_STATUS_OK:
-                    raise TransportError(
-                        f"CAN_CloseDevice failed with status {close_status}"
-                    )
+                if self._device_open:
+                    try:
+                        close_status = self._lib.CAN_CloseDevice(*self._channel_args)
+                    except Exception as error:
+                        raise TransportError(
+                            f"CAN_CloseDevice failed: {error}"
+                        ) from error
+                    if close_status != CANFD_STATUS_OK:
+                        raise TransportError(
+                            f"CAN_CloseDevice failed with status {close_status}"
+                        )
+                    self._device_open = False
 
                 # Step 4: a successful vendor close commits lifecycle release.
                 if self._lifecycle_key is not None:
@@ -711,7 +726,10 @@ class CANFDInterface:
             closed = getattr(self, "_closed_event", None)
             if closed is None or getattr(self, "_close_succeeded", False):
                 return
-            if closed.is_set() and getattr(self, "_lifecycle_key", None) is None:
+            if (
+                not getattr(self, "_device_open", False)
+                and getattr(self, "_lifecycle_key", None) is None
+            ):
                 return
             self.close()
         except BaseException:
@@ -728,20 +746,47 @@ def _load_library(library_path: str | Path | None) -> Any:
             cached = _library_handle_cache.get(key)
             if cached is not None:
                 return cached
+            directory_handle = None
+            directory = ""
             try:
-                lib = loader(str(candidate))
+                load_path = str(candidate)
+                if platform.system() == "Windows" and isinstance(candidate, Path):
+                    load_path = str(candidate.expanduser().resolve())
+                    directory = str(Path(load_path).parent)
+                    add_directory = getattr(os, "add_dll_directory", None)
+                    if (
+                        add_directory is not None
+                        and directory not in _dll_directory_handles
+                    ):
+                        directory_handle = add_directory(directory)
+                lib = loader(load_path)
             except OSError as error:
+                if directory_handle is not None:
+                    directory_handle.close()
                 errors.append(f"{candidate}: {error}")
                 continue
+            except BaseException:
+                if directory_handle is not None:
+                    directory_handle.close()
+                raise
+            if directory_handle is not None:
+                _dll_directory_handles[directory] = directory_handle
             _library_handle_cache[key] = lib
             return lib
 
     attempted = "\n".join(errors) if errors else "no candidates"
+    platform_hint = ""
+    if platform.system() == "Windows":
+        platform_hint = (
+            f" Python is {ctypes.sizeof(ctypes.c_void_p) * 8}-bit: use the matching "
+            "HCanbus.dll, install the vendor USB driver and Visual C++ runtime, "
+            "and keep dependency DLLs alongside it."
+        )
     raise TransportError(
         "Unable to load CANFD vendor library. The system loader is tried by default; "
         "pass library_path=... or set "
         f"{_ENV_LIBRARY_PATH} to the libcanbus.so/HCanbus.dll path if the library is "
-        f"not installed in a system search path. Attempted:\n{attempted}"
+        f"not installed in a system search path.{platform_hint} Attempted:\n{attempted}"
     )
 
 
@@ -764,15 +809,16 @@ def _library_candidates(library_path: str | Path | None) -> list[str | Path]:
     library_name = _default_library_name()
     candidates: list[str | Path] = []
     if library_path is not None:
-        candidates.append(Path(library_path))
+        return [Path(library_path)]
     env_path = os.environ.get(_ENV_LIBRARY_PATH)
     if env_path:
-        candidates.append(Path(env_path))
+        return [Path(env_path)]
 
     candidates.append(library_name)
 
     package_root = Path(__file__).resolve().parents[2]
-    candidates.append(Path("/usr/local/lib") / library_name)
+    if platform.system() != "Windows":
+        candidates.append(Path("/usr/local/lib") / library_name)
     candidates.append(package_root / "vendor" / "libcanbus" / library_name)
     candidates.append(package_root / "hand" / library_name)
     candidates.append(Path.cwd() / library_name)
@@ -793,14 +839,27 @@ def _ctypes_loader() -> Any:
     return ctypes.CDLL
 
 
-def _bind_signatures(lib: Any) -> None:
-    # Vendor process-level lifecycle (PDF §3.1/3.2). The library is expected to
-    # always export these — calling LibCANbus_Init exactly once per process and
-    # LibCANbus_Exit on shutdown is what prevents the documented memory leak.
-    if hasattr(lib, "LibCANbus_Init"):
+def _bind_signatures(lib: Any, *, windows: bool | None = None) -> None:
+    if windows is None:
+        windows = platform.system() == "Windows"
+    required = (
+        "CAN_ScanDevice",
+        "CAN_OpenDevice",
+        "CAN_CloseDevice",
+        "CAN_ReadDevInfo",
+        "CANFD_Init",
+        "CANFD_Transmit",
+        "CANFD_Receive",
+    )
+    for name in required:
+        if not hasattr(lib, name):
+            raise TransportError(f"incompatible CAN FD vendor library: missing {name}")
+    channel_types = [ctypes.c_uint] if windows else [ctypes.c_uint, ctypes.c_uint]
+    # Linux PDF §3.1/3.2. These entry points do not exist in Windows HCanbus.dll.
+    if not windows and hasattr(lib, "LibCANbus_Init"):
         lib.LibCANbus_Init.restype = ctypes.c_int
         lib.LibCANbus_Init.argtypes = []
-    if hasattr(lib, "LibCANbus_Exit"):
+    if not windows and hasattr(lib, "LibCANbus_Exit"):
         lib.LibCANbus_Exit.restype = ctypes.c_int
         lib.LibCANbus_Exit.argtypes = []
 
@@ -808,25 +867,23 @@ def _bind_signatures(lib: Any) -> None:
     lib.CAN_ScanDevice.argtypes = []
 
     lib.CAN_OpenDevice.restype = ctypes.c_int
-    lib.CAN_OpenDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    lib.CAN_OpenDevice.argtypes = channel_types
 
     lib.CAN_CloseDevice.restype = ctypes.c_int
-    lib.CAN_CloseDevice.argtypes = [ctypes.c_uint, ctypes.c_uint]
+    lib.CAN_CloseDevice.argtypes = channel_types
 
     lib.CAN_ReadDevInfo.restype = ctypes.c_int
     lib.CAN_ReadDevInfo.argtypes = [ctypes.c_uint, ctypes.POINTER(DevInfo)]
 
     lib.CANFD_Init.restype = ctypes.c_int
     lib.CANFD_Init.argtypes = [
-        ctypes.c_uint,
-        ctypes.c_uint,
+        *channel_types,
         ctypes.POINTER(CanFDConfig),
     ]
 
     lib.CANFD_Transmit.restype = ctypes.c_int
     lib.CANFD_Transmit.argtypes = [
-        ctypes.c_uint,
-        ctypes.c_uint,
+        *channel_types,
         ctypes.POINTER(CanFDMsg),
         ctypes.c_uint,
         ctypes.c_int,
@@ -834,10 +891,9 @@ def _bind_signatures(lib: Any) -> None:
 
     lib.CANFD_Receive.restype = ctypes.c_int
     lib.CANFD_Receive.argtypes = [
-        ctypes.c_uint,
-        ctypes.c_uint,
+        *channel_types,
         ctypes.POINTER(CanFDMsg),
-        ctypes.c_uint,
+        ctypes.c_int,
         ctypes.c_int,
     ]
 

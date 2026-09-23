@@ -44,6 +44,12 @@ This project follows Semantic Versioning.
 
 - `scripts/release.py` reads the version from `pyproject.toml` with a regex instead of `tomllib`, which is not in the standard library on Python 3.10 — the minimum this package supports.
 
+- Bind MiniCANFD's Windows `HCanbus.dll` with its documented single-channel
+  stdcall API, without Linux-only Init/Exit calls. Validate channel selection,
+  retain DLL dependency directories, and fail explicit library paths without
+  falling back to another binary. Keep failed initialization cleanup reachable
+  through managed close/recover and the shared pool.
+
 ## 1.0.0 - 2026-09-01
 
 - Publish the stable explicit-lifecycle transport API for classic CAN, vendor

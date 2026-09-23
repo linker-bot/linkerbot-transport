@@ -12,6 +12,11 @@ The package does not depend on ROS, hand models, arm models or kinematics.
 
 ## Installation
 
+Windows MiniCANFD uses `CANFDTransport` with the vendor's `HCanbus.dll`.
+Its ABI uses one enumerated channel number, unlike Linux's device/channel pair.
+See [MiniCANFD setup, ABI and validation](docs/minicanfd.md) for the source-only
+Windows changes, driver requirements and precise channel semantics.
+
 Install only the backend required by the application:
 
 ```bash

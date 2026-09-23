@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import platform
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,7 +27,7 @@ from .socketcan_backend import (
     DEFAULT_NOMINAL_BITRATE,
     SocketCANFDBackend,
 )
-from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
+from .types import CANFDBackend, CANFDConfigOptions, CANFDMessage, dlc_to_length
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +41,13 @@ class CANFDTransportKey:
 
 
 class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
-    """CAN FD transport whose constructor performs no device I/O."""
+    """Vendor CAN FD transport whose constructor performs no device I/O.
+
+    On Windows, ``device_index`` is HCanbus.dll's enumerated channel number
+    (devNum), and ``channel_index`` must be zero. Linux keeps separate device
+    and channel indices. Explicit library paths are fixed at construction;
+    otherwise the loader reads LINKERBOT_CANFD_LIB when opening.
+    """
 
     def __init__(
         self,
@@ -60,13 +68,23 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
             raise ValidationError("device_index must be non-negative")
         if channel_index < 0:
             raise ValidationError("channel_index must be non-negative")
+        if device_index > 0xFFFFFFFF or channel_index > 0xFFFFFFFF:
+            raise ValidationError("device_index and channel_index must fit uint32")
+        if platform.system() == "Windows" and channel_index != 0:
+            raise ValidationError(
+                "Windows uses device_index as devNum; channel_index must be 0"
+            )
         if (
             not isinstance(max_consecutive_errors, int)
             or isinstance(max_consecutive_errors, bool)
             or max_consecutive_errors <= 0
         ):
             raise ValidationError("max_consecutive_errors must be a positive int")
-        normalized_path = None if library_path is None else str(library_path)
+        normalized_path = (
+            None
+            if library_path is None
+            else os.path.abspath(os.path.expanduser(library_path))
+        )
         normalized_config = config or CANFDConfigOptions()
         self._key = CANFDTransportKey(
             device_index,
@@ -80,14 +98,24 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
             def create(
                 on_bus_error: Callable[[Exception], None],
             ) -> CANFDMessageDispatcher:
-                return CANFDMessageDispatcher(
-                    device_index=device_index,
-                    channel_index=channel_index,
-                    library_path=library_path,
-                    config=normalized_config,
-                    on_bus_error=on_bus_error,
-                    max_consecutive_errors=max_consecutive_errors,
-                )
+                try:
+                    return CANFDMessageDispatcher(
+                        device_index=device_index,
+                        channel_index=channel_index,
+                        library_path=normalized_path,
+                        config=normalized_config,
+                        on_bus_error=on_bus_error,
+                        max_consecutive_errors=max_consecutive_errors,
+                    )
+                except BaseException as error:
+                    failed_interface = getattr(error, "_failed_interface", None)
+                    if failed_interface is not None:
+                        setattr(
+                            error,
+                            "_failed_dispatcher",
+                            _FailedInterfaceCleanup(failed_interface),
+                        )
+                    raise
 
             resolved_factory: DispatcherFactory[CANFDMessage] = create
         else:
@@ -104,6 +132,20 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
         """Return the default key used to share this physical channel."""
 
         return self._key
+
+
+class _FailedInterfaceCleanup:
+    """Keep an unreturned vendor handle reachable through managed close/recover."""
+
+    def __init__(self, interface: CANFDBackend) -> None:
+        self._interface = interface
+
+    def stop(self) -> None:
+        self._interface.close()
+
+    def unsubscribe(self, callback: Callable[[CANFDMessage], None]) -> None:
+        # Opening failed before a dispatcher or any subscription existed.
+        pass
 
 
 @dataclass(frozen=True, slots=True)
