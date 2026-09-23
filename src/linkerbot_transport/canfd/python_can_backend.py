@@ -13,7 +13,9 @@ from linkerbot_transport._python_can import (
     BusOption,
     ChannelClaim,
     freeze_bus_options,
+    open_bus,
     positive_int,
+    rollback_bus_open,
     validate_channel,
 )
 from linkerbot_transport.errors import LinkerbotError, TransportError, ValidationError
@@ -159,18 +161,17 @@ class PythonCANFDBackend:
             kwargs: dict[str, Any] = dict(options)
             if timing_values:
                 kwargs["timing"] = restore_fd_timing(timing_values)
-            self._bus = can.Bus(
+            self._bus = open_bus(
                 channel=channel,
                 interface=interface,
                 bitrate=bitrate,
                 data_bitrate=data_bitrate,
                 fd=fd,
                 receive_own_messages=receive_own_messages,
-                ignore_config=True,
                 **kwargs,
             )
-        except BaseException:
-            self._claim.release()
+        except BaseException as error:
+            rollback_bus_open(error, self._claim)
             raise
 
     @property

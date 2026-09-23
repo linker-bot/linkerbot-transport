@@ -4,6 +4,15 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Track PCAN initialization ownership before later driver configuration can fail.
+  Roll back only channels acquired by that instance, check Uninitialize results,
+  and release Windows receive events after native shutdown. Keep failed cleanup
+  reachable through the transport/pool for explicit recovery.
+
+- Release the local SLCAN serial handle even when the adapter's close command
+  fails after USB disconnection. Retain partial initialization and failed serial
+  cleanup for close/recover retries in classic CAN and python-can CAN FD.
+
 - Add `PythonCANFDTransport` for python-can CAN FD backends and CANable 2.0
   SLCAN FD. Snapshot serial/bit-timing configuration, include pyserial in FD
   extras, and share DLC/FD/BRS conversion with Linux SocketCAN FD. Keep remote

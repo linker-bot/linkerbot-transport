@@ -7,6 +7,7 @@ import pytest
 
 from linkerbot_transport import SharedTransportPool
 from linkerbot_transport.can import CANRouteKey, CANTransport
+from linkerbot_transport.can import can as can_dispatcher
 from linkerbot_transport.errors import TransportError, ValidationError
 
 
@@ -33,7 +34,7 @@ def test_pcan_explicit_settings_are_snapshotted_and_open_is_lazy(monkeypatch):
         calls.append(kwargs)
         return bus
 
-    monkeypatch.setattr(can, "Bus", create_bus)
+    monkeypatch.setattr(can_dispatcher, "open_bus", create_bus)
     options = {"auto_reset": True}
     transport = CANTransport(
         "PCAN_USBBUS1", "pcan", bitrate=500_000, bus_options=options
@@ -49,7 +50,6 @@ def test_pcan_explicit_settings_are_snapshotted_and_open_is_lazy(monkeypatch):
                 bitrate=500_000,
                 fd=False,
                 receive_own_messages=False,
-                ignore_config=True,
                 auto_reset=True,
             )
         ]
@@ -82,7 +82,7 @@ def test_pool_shares_matching_settings_but_rejects_live_bitrate_conflict(monkeyp
         calls.append(kwargs)
         return StubBus()
 
-    monkeypatch.setattr(can, "Bus", create_bus)
+    monkeypatch.setattr(can_dispatcher, "open_bus", create_bus)
     pool = SharedTransportPool()
     first = CANTransport("PCAN_USBBUS1", "pcan", bitrate=1_000_000)
     same = CANTransport("PCAN_USBBUS1", "pcan", bitrate=1_000_000)
@@ -105,7 +105,7 @@ def test_pool_shares_matching_settings_but_rejects_live_bitrate_conflict(monkeyp
 
 def test_failed_shutdown_keeps_channel_claim_until_cleanup_succeeds(monkeypatch):
     bus = StubBus()
-    monkeypatch.setattr(can, "Bus", lambda **kwargs: bus)
+    monkeypatch.setattr(can_dispatcher, "open_bus", lambda **kwargs: bus)
     first = CANTransport("PCAN_USBBUS2", "pcan")
     other = CANTransport("PCAN_USBBUS2", "pcan", bitrate=500_000)
     first.open()
@@ -123,11 +123,11 @@ def test_driver_open_failure_releases_claim(monkeypatch):
     def fail(**kwargs):
         raise can.CanInitializationError("driver missing")
 
-    monkeypatch.setattr(can, "Bus", fail)
+    monkeypatch.setattr(can_dispatcher, "open_bus", fail)
     first = CANTransport("PCAN_USBBUS3", "pcan")
     with pytest.raises(TransportError, match="driver missing"):
         first.open()
-    monkeypatch.setattr(can, "Bus", lambda **kwargs: StubBus())
+    monkeypatch.setattr(can_dispatcher, "open_bus", lambda **kwargs: StubBus())
     other = CANTransport("PCAN_USBBUS3", "pcan", bitrate=500_000)
     other.open()
     other.close()

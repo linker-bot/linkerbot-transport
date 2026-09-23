@@ -13,7 +13,9 @@ from linkerbot_transport._python_can import (
     BusOption,
     ChannelClaim,
     freeze_bus_options,
+    open_bus,
     positive_int,
+    rollback_bus_open,
     validate_channel,
 )
 from linkerbot_transport.errors import (
@@ -136,17 +138,16 @@ class CANMessageDispatcher:
         )
         try:
             backend_options: dict[str, Any] = dict(options)
-            self._bus: can.BusABC = can.Bus(
+            self._bus: can.BusABC = open_bus(
                 channel=interface_name,
                 interface=interface_type,
                 bitrate=bitrate,
                 fd=False,
                 receive_own_messages=receive_own_messages,
-                ignore_config=True,
                 **backend_options,
             )
-        except BaseException:
-            self._channel_claim.release()
+        except BaseException as error:
+            rollback_bus_open(error, self._channel_claim)
             raise
         try:
             self._recv_thread.start()

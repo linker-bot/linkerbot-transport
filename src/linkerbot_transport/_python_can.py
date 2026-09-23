@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .errors import TransportError, ValidationError
+
+if TYPE_CHECKING:
+    import can
+
+_LOGGER = logging.getLogger(__name__)
 
 BusOption = str | int | float | bool | None
 _RESERVED = {
@@ -102,3 +109,62 @@ class ChannelClaim:
             if current.count == 0:
                 del _CHANNELS[self._key]
             self._released = True
+
+
+def open_bus(*, channel: str, interface: str, **kwargs: Any) -> can.BusABC:
+    """Open explicit settings with local lifecycle fixes for affected drivers.
+
+    Import hardware backends only at open time. Direct backend construction
+    bypasses python-can's ambient configuration, just like ignore_config=True.
+    No global python-can registry or driver class is patched.
+    """
+    if interface == "slcan":
+        from ._slcan import ManagedSlcanBus
+
+        return ManagedSlcanBus(channel=channel, **kwargs)
+    if interface == "pcan":
+        from ._pcan import ManagedPcanBus
+
+        return ManagedPcanBus(channel=channel, **kwargs)
+    import can
+
+    return can.Bus(channel=channel, interface=interface, ignore_config=True, **kwargs)
+
+
+def rollback_bus_open(error: BaseException, claim: ChannelClaim) -> None:
+    """Retain partially constructed buses until their resources are released."""
+    bus = getattr(error, "_failed_bus", None)
+    if bus is None:
+        claim.release()
+        return
+    owner = _FailedBusCleanup(bus, claim)
+    try:
+        owner.stop()
+    except BaseException as cleanup_error:
+        _LOGGER.warning("python-can initialization cleanup failed: %s", cleanup_error)
+        # The existing managed transport/pool retry this owner before reopening.
+        setattr(error, "_failed_dispatcher", owner)
+        if isinstance(error, Exception) and not isinstance(cleanup_error, Exception):
+            setattr(cleanup_error, "_failed_dispatcher", owner)
+            raise cleanup_error from error
+
+
+class _FailedBusCleanup:
+    """Cleanup-only dispatcher for a bus that failed before workers existed."""
+
+    def __init__(self, bus: can.BusABC, claim: ChannelClaim) -> None:
+        self._bus = bus
+        self._claim = claim
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._bus.shutdown()
+                self._claim.release()
+                self._closed = True
+
+    def unsubscribe(self, callback: object) -> None:
+        # No worker or subscription was created during the failed open.
+        pass
