@@ -6,9 +6,11 @@ The vendor library documents two process-level entry points in
 - ``LibCANbus_Init`` allocates global system resources.
 - ``LibCANbus_Exit`` releases them and explicitly "prevents memory leaks".
 
-On Linux, while one or more ``CANFDInterface`` instances are open, these entry points
-must be called as one shared Init/Exit pair per loaded ``.so``. Windows HCanbus.dll
-has no Init/Exit exports and addresses each enumerated channel with one devNum.
+Linux libraries exporting these entry points share one Init/Exit pair per loaded
+``.so``. The verified legacy Linux device API manages its lifecycle internally;
+it has neither entry point and exposes ``CAN_GetDevType`` instead of
+``CAN_GetCHType``. Windows HCanbus.dll also manages its own lifecycle and
+addresses each enumerated channel with one devNum.
 This module keeps that vendor lifecycle reference count separate from the operating
 system handle lifetime: loaded main-library and Linux dependency handles are
 cached strongly for the rest of the process and are never explicitly unloaded.
@@ -24,6 +26,7 @@ import logging
 import os
 import platform
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +68,18 @@ _dependency_handle_cache: dict[str, Any] = {}
 _lifecycle_lock = threading.Lock()
 _lifecycle_refcount: dict[str, int] = {}
 _lifecycle_lib: dict[str, Any] = {}
+# Scanning can replace vendor-global channel tables. Coordinate it with opens
+# and closes, and reject public enumeration while channels still own handles.
+_enumeration_lock = threading.Lock()
+_open_channel_counts: dict[str, int] = {}
+_scanned_device_counts: dict[str, int] = {}
 _finalize_safe = True
+
+
+@dataclass
+class _LifecycleReference:
+    key: str
+    released: bool = False
 
 
 def _canonical_library_key(candidate: str | Path) -> str:
@@ -87,12 +101,13 @@ def _canonical_library_key(candidate: str | Path) -> str:
 def _library_key(lib: Any) -> str:
     """Return a stable refcount key for the loaded vendor library.
 
-    ``ctypes.CDLL`` exposes the resolved library path on ``_name``. We use the
-    realpath so symlinks (``/usr/local/lib/libcanbus.so`` →
-    ``/usr/local/lib/libcanbus.so.1``) collapse to one refcount slot. Test
-    fakes typically have no ``_name``; fall back to ``id(lib)`` so each fake
-    gets its own bucket and tests stay isolated.
+    The native handle unifies a system-loader soname with its resolved absolute
+    path, including when enumeration is followed by transport construction.
+    Fakes without handles use a normalized path or their Python identity.
     """
+    handle = getattr(lib, "_handle", None)
+    if isinstance(handle, int) and handle:
+        return f"native:{platform.system().lower()}:{handle}"
     name = getattr(lib, "_name", None)
     if name:
         try:
@@ -102,67 +117,117 @@ def _library_key(lib: Any) -> str:
     return f"id:{id(lib)}"
 
 
-def _lifecycle_acquire(lib: Any) -> str:
+def _scan_device_count(lib: Any) -> int:
+    """Scan an idle library, or reuse its live snapshot under enumeration lock."""
+    key = _library_key(lib)
+    if _open_channel_counts.get(key, 0):
+        count = _scanned_device_counts.get(key)
+        if count is None:
+            raise TransportError(
+                "MiniCANFD has open channels without a scan snapshot; "
+                "close all channels before rescanning"
+            )
+        return count
+    _scanned_device_counts.pop(key, None)
+    count = lib.CAN_ScanDevice()
+    if count < CANFD_SCAN_NO_DEVICE:
+        raise TransportError(f"CAN_ScanDevice failed with status {count}")
+    _scanned_device_counts[key] = count
+    return count
+
+
+def _linux_uses_legacy_api(lib: Any) -> bool:
+    """Recognize the verified legacy export set, rejecting partial lifecycles."""
+    has_init = hasattr(lib, "LibCANbus_Init")
+    has_exit = hasattr(lib, "LibCANbus_Exit")
+    if has_init and has_exit:
+        return False
+    if (
+        not has_init
+        and not has_exit
+        and hasattr(lib, "CAN_GetDevType")
+        and not hasattr(lib, "CAN_GetCHType")
+    ):
+        return True
+    missing = "LibCANbus_Exit" if has_init else "LibCANbus_Init"
+    raise TransportError(
+        f"vendor library is missing {missing}; expected a complete Init/Exit "
+        "pair or the verified legacy Linux CAN_GetDevType API"
+    )
+
+
+def _lifecycle_acquire(lib: Any) -> _LifecycleReference | None:
     """Increment refcount, calling ``LibCANbus_Init`` on first acquire.
 
     Raises ``TransportError`` if ``LibCANbus_Init`` returns non-zero on the first
     call; the refcount is not bumped in that case so a later acquire will
     retry. Subsequent acquires for the same library skip the vendor call.
+    A previous failed Exit is retried before starting a new lifecycle.
     """
+    if _linux_uses_legacy_api(lib):
+        return None
     key = _library_key(lib)
     with _lifecycle_lock:
         count = _lifecycle_refcount.get(key, 0)
         if count == 0:
-            init_fn = getattr(lib, "LibCANbus_Init", None)
-            if init_fn is None:
-                raise TransportError(
-                    "vendor library is missing LibCANbus_Init; update libcanbus.so "
-                    "to a version that exports the documented lifecycle entry points"
-                )
-            status = init_fn()
+            pending = _lifecycle_lib.get(key)
+            if pending is not None:
+                error = _exit_library(pending)
+                if error is not None:
+                    raise error
+                _lifecycle_lib.pop(key, None)
+            status = lib.LibCANbus_Init()
             if status != CANFD_STATUS_OK:
                 raise TransportError(f"LibCANbus_Init failed with status {status}")
             _lifecycle_lib[key] = lib
         _lifecycle_refcount[key] = count + 1
-        return key
+        return _LifecycleReference(key)
 
 
-def _lifecycle_release(key: str | None) -> None:
-    """Decrement refcount, calling ``LibCANbus_Exit`` when it reaches zero.
+def _lifecycle_release(ref: _LifecycleReference | None) -> TransportError | None:
+    """Release once and retry pending Exit without consuming another reference.
 
-    No-op if ``key`` is ``None`` (constructor failed before acquire) or if the
-    refcount is already zero (defensive — should not happen with paired
-    acquire/release). Exceptions from ``LibCANbus_Exit`` are swallowed with a
-    warning because they leave the SDK in a usable state and a stuck Exit
-    should not break shutdown.
+    An Exit failure is returned and logged. Both a repeated close and the next
+    acquire can retry cleanup. A released reference cannot decrement references
+    belonging to interfaces opened after its failed cleanup was recovered.
     """
-    if key is None or not _finalize_safe:
+    if ref is None or not _finalize_safe:
         return
     with _lifecycle_lock:
+        key = ref.key
         count = _lifecycle_refcount.get(key, 0)
-        if count <= 0:
-            return
-        count -= 1
-        _lifecycle_refcount[key] = count
+        if not ref.released:
+            ref.released = True
+            count = max(0, count - 1)
+            if count:
+                _lifecycle_refcount[key] = count
+            else:
+                _lifecycle_refcount.pop(key, None)
         if count > 0:
             return
-        lib = _lifecycle_lib.pop(key, None)
-        _lifecycle_refcount.pop(key, None)
+        lib = _lifecycle_lib.get(key)
         if lib is None:
-            return
-        exit_fn = getattr(lib, "LibCANbus_Exit", None)
-        if exit_fn is None:
             return
         # Keep acquire/release serialized through the vendor Exit call. If the
         # lock were released first, another thread could call Init and then have
         # this stale Exit tear down the resources underneath its live interface.
-        try:
-            status = exit_fn()
-        except Exception as error:
-            _logger.warning("LibCANbus_Exit raised: %s", error)
-            return
-        if status != CANFD_STATUS_OK:
-            _logger.warning("LibCANbus_Exit returned status %s", status)
+        error = _exit_library(lib)
+        if error is None:
+            _lifecycle_lib.pop(key, None)
+        else:
+            _logger.warning("%s", error)
+        return error
+
+
+def _exit_library(lib: Any) -> TransportError | None:
+    """Release vendor resources without forgetting a failed cleanup."""
+    try:
+        status = lib.LibCANbus_Exit()
+    except Exception as error:
+        return TransportError(f"LibCANbus_Exit failed: {error}", cause=error)
+    if status != CANFD_STATUS_OK:
+        return TransportError(f"LibCANbus_Exit failed with status {status}")
+    return None
 
 
 def _lifecycle_snapshot() -> dict[str, int]:
@@ -265,8 +330,9 @@ class CANFDInterface:
     ) -> None:
         """Open and initialize a CANFD adapter channel.
 
-        Linux holds an Init/Exit reference while open. Windows uses the DLL's
-        own process lifecycle. A failed initialization closes its channel; if
+        Lifecycle-aware Linux libraries hold an Init/Exit reference while open.
+        Legacy Linux and Windows libraries manage their own lifecycle.
+        A failed initialization closes its channel; if
         cleanup also fails, the exception retains the interface for managed
         close/recover instead of releasing ownership prematurely.
         """
@@ -310,7 +376,7 @@ class CANFDInterface:
         # close on a never-opened instance.
         self._closed_event.set()
         self._close_complete_event.set()
-        self._lifecycle_key: str | None = None
+        self._lifecycle_ref: _LifecycleReference | None = None
         self._lib = _load_library(library_path)
         _bind_signatures(self._lib, windows=self._windows)
         # Hot-path zero-alloc buffers. The TX frame is reused across every
@@ -326,7 +392,7 @@ class CANFDInterface:
         # release it if anything below this point raises so we don't leak the
         # Init reference on a partially-initialized interface.
         if not self._windows:
-            self._lifecycle_key = _lifecycle_acquire(self._lib)
+            self._lifecycle_ref = _lifecycle_acquire(self._lib)
         try:
             self._open()
         except BaseException as error:
@@ -355,23 +421,37 @@ class CANFDInterface:
         return self._config
 
     def _open(self) -> None:
-        # _open runs once in __init__ before any worker thread has a reference
-        # to the interface, so no other lock is required here.
-        count = self._lib.CAN_ScanDevice()
-        if count < CANFD_SCAN_NO_DEVICE:
-            raise TransportError(f"CAN_ScanDevice failed with status {count}")
+        # Instance I/O locks are unnecessary before workers receive this object.
+        # The process-wide guard prevents enumeration racing the vendor open.
+        with _enumeration_lock:
+            self._open_locked()
+
+    def _open_locked(self) -> None:
+        if (
+            not self._windows
+            and _linux_uses_legacy_api(self._lib)
+            and self._channel_index != 0
+        ):
+            raise ValidationError(
+                "legacy Linux MiniCANFD supports only confirmed channel 0; "
+                "the device-level type query does not describe other channels"
+            )
+        count = _scan_device_count(self._lib)
         if count == CANFD_SCAN_NO_DEVICE:
             raise TransportError("No CANFD adapter found")
         if self._device_index >= count:
             raise TransportError(
                 f"CANFD device_index {self._device_index} out of range; "
-                f"found {count} adapter(s)"
+                f"found {count} adapter(s) in the scan snapshot; "
+                "close all channels before rescanning changed USB topology"
             )
 
         status = self._lib.CAN_OpenDevice(*self._channel_args)
         if status != CANFD_STATUS_OK:
             raise TransportError(f"CAN_OpenDevice failed with status {status}")
         self._device_open = True
+        key = _library_key(self._lib)
+        _open_channel_counts[key] = _open_channel_counts.get(key, 0) + 1
         config = self._build_ctypes_config()
         status = self._lib.CANFD_Init(*self._channel_args, ctypes.byref(config))
         if status != CANFD_STATUS_OK:
@@ -583,6 +663,8 @@ class CANFDInterface:
 
         ``CAN_CloseDevice`` failures reject future I/O but retain device and
         lifecycle ownership so a later ``close()`` can retry the vendor call.
+        A later ``LibCANbus_Exit`` failure is also reported and retryable without
+        closing the already released channel or decrementing its reference twice.
         """
         # Serialize the full transaction. A caller arriving after a failed
         # attempt becomes the next owner and retries CAN_CloseDevice instead of
@@ -603,22 +685,34 @@ class CANFDInterface:
 
                 # Step 3: actually close the vendor side.
                 if self._device_open:
-                    try:
-                        close_status = self._lib.CAN_CloseDevice(*self._channel_args)
-                    except Exception as error:
-                        raise TransportError(
-                            f"CAN_CloseDevice failed: {error}"
-                        ) from error
-                    if close_status != CANFD_STATUS_OK:
-                        raise TransportError(
-                            f"CAN_CloseDevice failed with status {close_status}"
-                        )
-                    self._device_open = False
+                    with _enumeration_lock:
+                        try:
+                            close_status = self._lib.CAN_CloseDevice(
+                                *self._channel_args
+                            )
+                        except Exception as error:
+                            raise TransportError(
+                                f"CAN_CloseDevice failed: {error}"
+                            ) from error
+                        if close_status != CANFD_STATUS_OK:
+                            raise TransportError(
+                                f"CAN_CloseDevice failed with status {close_status}"
+                            )
+                        self._device_open = False
+                        key = _library_key(self._lib)
+                        remaining = _open_channel_counts[key] - 1
+                        if remaining:
+                            _open_channel_counts[key] = remaining
+                        else:
+                            _open_channel_counts.pop(key)
+                            _scanned_device_counts.pop(key, None)
 
                 # Step 4: a successful vendor close commits lifecycle release.
-                if self._lifecycle_key is not None:
-                    _lifecycle_release(self._lifecycle_key)
-                    self._lifecycle_key = None
+                if self._lifecycle_ref is not None:
+                    cleanup_error = _lifecycle_release(self._lifecycle_ref)
+                    if cleanup_error is not None:
+                        raise cleanup_error
+                    self._lifecycle_ref = None
                 self._close_succeeded = True
             finally:
                 # Publish the end of every attempt. Waiters remain serialized by
@@ -728,7 +822,7 @@ class CANFDInterface:
                 return
             if (
                 not getattr(self, "_device_open", False)
-                and getattr(self, "_lifecycle_key", None) is None
+                and getattr(self, "_lifecycle_ref", None) is None
             ):
                 return
             self.close()

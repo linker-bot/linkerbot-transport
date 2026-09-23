@@ -171,6 +171,64 @@ def test_send_failure_is_classified_without_fake_acknowledgement() -> None:
     transport.close()
 
 
+def test_synchronous_send_claim_precedes_reply_received_inside_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock(10.0)
+    transport = FakeTransport[int](monotonic=clock)
+    transport.open()
+    route = transport.subscribe_route(2)
+
+    def send_with_immediate_reply(message: int) -> None:
+        clock.advance(0.1)
+        transport.emit(2)
+        clock.advance(0.1)
+
+    monkeypatch.setattr(
+        transport.current_dispatcher, "send_now", send_with_immediate_reply
+    )
+    try:
+        receipt = transport.send(1)
+        result = receipt.result(timeout=0)
+        received = route.receive(timeout_s=0)
+        assert result.claimed_at_s == 10.0
+        assert result.accepted_at_s <= result.claimed_at_s
+        assert result.claimed_at_s < received.received_at_s < result.completed_at_s
+        assert result.generation == received.generation == 1
+        assert result.outcome is SendOutcome.DISPATCHED
+        assert transport.get_health().tx_frames == 1
+    finally:
+        transport.close()
+
+
+def test_synchronous_send_failure_retains_pre_send_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock(10.0)
+    transport = FakeTransport[int](monotonic=clock)
+    transport.open()
+
+    def fail_during_send(message: int) -> None:
+        clock.advance(0.2)
+        raise OSError("write failed after claim")
+
+    monkeypatch.setattr(transport.current_dispatcher, "send_now", fail_during_send)
+    try:
+        receipt = transport.send(1)
+        with pytest.raises(TransportError, match="write failed after claim"):
+            receipt.result(timeout=0)
+        assert receipt.accepted_at_s == receipt.claimed_at_s == 10.0
+        assert receipt.generation == 1
+        assert receipt.outcome is SendOutcome.FAILED
+        health = transport.get_health()
+        assert health.state is TransportState.OPEN
+        assert health.consecutive_errors == 1
+        assert health.last_error_code is ErrorCode.TRANSPORT
+        assert health.tx_frames == health.tx_bytes == 0
+    finally:
+        transport.close()
+
+
 def test_receive_overflow_and_queue_depth_are_reported_in_transport_health() -> None:
     transport = FakeTransport[int]()
     transport.open()

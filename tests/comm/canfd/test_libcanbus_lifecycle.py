@@ -333,3 +333,121 @@ def test_missing_libcanbus_init_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(TransportError, match="missing LibCANbus_Init"):
         backend.CANFDInterface()
+
+
+def test_native_handle_unifies_absolute_and_loader_library_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _FakeLib("libcanbus.so")
+    second = _FakeLib("/resolved/libcanbus.so")
+    first._handle = second._handle = 1234
+    libs = iter((first, second))
+    monkeypatch.setattr(backend, "_load_library", lambda path: next(libs))
+
+    a = backend.CANFDInterface(channel_index=0)
+    b = backend.CANFDInterface(channel_index=1)
+    try:
+        assert backend._library_key(first) == backend._library_key(second)
+        assert first.LibCANbus_Init.calls == [()]
+        assert second.LibCANbus_Init.calls == []
+        a.close()
+        assert first.LibCANbus_Exit.calls == []
+    finally:
+        a.close()
+        b.close()
+    assert first.LibCANbus_Exit.calls == [()]
+    assert second.LibCANbus_Exit.calls == []
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_library_exit_is_retried_before_another_initialization(
+    monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    lib = _FakeLib()
+    _patch_loader(monkeypatch, lib)
+    interface = backend.CANFDInterface()
+    original = OSError("USB cleanup failed")
+
+    def fail_exit():
+        if raises:
+            raise original
+        return -9
+
+    lib.LibCANbus_Exit.hook = fail_exit
+    with pytest.raises(TransportError, match="LibCANbus_Exit"):
+        interface.close()
+    assert backend._lifecycle_snapshot() == {}
+    assert backend._library_key(lib) in backend._lifecycle_lib
+    with pytest.raises(TransportError, match="LibCANbus_Exit") as caught:
+        backend.CANFDInterface()
+    if raises:
+        assert caught.value.cause is original
+    assert lib.LibCANbus_Init.calls == [()]
+    assert lib.CAN_OpenDevice.calls == [(0, 0)]
+
+    lib.LibCANbus_Exit.hook = None
+    recovered = backend.CANFDInterface()
+    try:
+        assert len(lib.LibCANbus_Init.calls) == 2
+        exits_before_retry = len(lib.LibCANbus_Exit.calls)
+        interface.close()
+        assert len(lib.LibCANbus_Exit.calls) == exits_before_retry
+        assert backend._lifecycle_snapshot() == {backend._library_key(lib): 1}
+        assert lib.CAN_CloseDevice.calls == [(0, 0)]
+    finally:
+        recovered.close()
+    assert backend._lifecycle_lib == {}
+
+
+@pytest.mark.parametrize("failure", ["status", "exception", "interrupt"])
+def test_failed_library_exit_can_retry_close_without_double_channel_release(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    lib = _FakeLib()
+    _patch_loader(monkeypatch, lib)
+    interface = backend.CANFDInterface()
+
+    def fail_exit() -> int:
+        if failure == "interrupt":
+            raise KeyboardInterrupt("interrupted cleanup")
+        if failure == "exception":
+            raise OSError("failed cleanup")
+        return -9
+
+    lib.LibCANbus_Exit.hook = fail_exit
+    expected_error = KeyboardInterrupt if failure == "interrupt" else TransportError
+    with pytest.raises(expected_error):
+        interface.close()
+    assert backend._lifecycle_snapshot() == {}
+    assert not interface._close_succeeded
+    assert backend._library_key(lib) in backend._lifecycle_lib
+
+    lib.LibCANbus_Exit.hook = None
+    interface.close()
+    interface.close()
+    assert interface._close_succeeded
+    assert lib.CAN_CloseDevice.calls == [(0, 0)]
+    assert len(lib.LibCANbus_Exit.calls) == 2
+    assert backend._lifecycle_lib == {}
+
+
+def test_initialization_failure_retains_interface_when_library_exit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lib = _FakeLib()
+    lib.CANFD_Init.result = 3
+    lib.LibCANbus_Exit.result = -9
+    _patch_loader(monkeypatch, lib)
+
+    with pytest.raises(TransportError, match="CANFD_Init") as caught:
+        backend.CANFDInterface()
+    interface = caught.value._failed_interface
+    assert not interface._close_succeeded
+    assert backend._lifecycle_snapshot() == {}
+    assert backend._library_key(lib) in backend._lifecycle_lib
+
+    lib.LibCANbus_Exit.result = 0
+    interface.close()
+    assert lib.CAN_CloseDevice.calls == [(0, 0)]
+    assert len(lib.LibCANbus_Exit.calls) == 2
+    assert backend._lifecycle_lib == {}

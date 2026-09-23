@@ -77,6 +77,9 @@ CANFD_EXPORTS = {
     "CANFDTransport",
     "CANFDTransportKey",
     "CANRouteKey",
+    "MiniCANFDChannel",
+    "MiniCANFDEnumerationFailure",
+    "MiniCANFDEnumerationResult",
     "RouteSubscription",
     "RoutedMessage",
     "SendOutcome",
@@ -87,6 +90,7 @@ CANFD_EXPORTS = {
     "PythonCANFDTransportKey",
     "SocketCANFDTransportKey",
     "dlc_to_length",
+    "enumerate_minicanfd_channels",
     "length_to_dlc",
 }
 

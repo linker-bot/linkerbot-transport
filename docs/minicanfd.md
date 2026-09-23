@@ -30,13 +30,81 @@ Windows 必须安装厂商 USB 驱动，以及匹配 Python 进程位数的 DLL 
 不会悄悄换另一份库。使用共享池时保持环境配置固定，推荐显式路径以明确连接身份。
 构造阶段不会加载 DLL、扫描 USB 或创建收发线程。
 
+## 显式枚举 FD 通道
+
+当前源码新增 `enumerate_minicanfd_channels()`，尚未包含在 1.0.0 发布包中。
+它只扫描适配器并查询通道类型，不打开 CAN 通道、不配置速率、不收发 CAN 帧，
+不识别连接的灵巧手。导入函数本身不加载动态库。
+
+Windows 扫描返回原生通道编号，可以直接枚举：
+
+```python
+from linkerbot_transport.canfd import CANFDTransport, enumerate_minicanfd_channels
+
+result = enumerate_minicanfd_channels(r"C:\MiniCANFD\HCanbus.dll")
+for failure in result.failures:
+    print(failure.stage, failure.device_index, failure.channel_index, failure.error)
+for channel in result.channels:
+    transport = CANFDTransport(
+        device_index=channel.device_index,
+        channel_index=channel.channel_index,
+        library_path=channel.library_path,
+    )  # 构造后仍关闭；明确选择目标和通信参数后才调用 open()
+```
+
+返回 `MiniCANFDEnumerationResult`，包含不可变元组 `channels` 和 `failures`。
+每个 `MiniCANFDChannel` 保存 `device_index`、`channel_index` 和已加载库的路径，
+不会把系统加载器找到的库误解释为工作目录下的同名文件。
+`MiniCANFDEnumerationFailure` 保留失败阶段、相关原生索引以及 `TransportError`；
+底层异常在 `error.cause` 中保留。通道列表为空时应同时检查失败列表：无适配器、
+只有经典 CAN/LIN 通道、库缺失、扫描失败和布局未知是不同情况。
+
+Linux V1.3 的 `CAN_ScanDevice()` 只返回物理设备数，`Dev_Info` 没有通道总数，
+`CAN_GetCHType(devNum, chNum)` 也未定义越界查询的有效范围。当前可用资料未提供
+可可靠识别型号及其通道数的完整对应表。因此需要按厂商规格或已确认的接线提供
+`linux_channels`，不能由“扫描到 1 个设备”推断出 2 个通道：
+
+```python
+result = enumerate_minicanfd_channels(
+    "/opt/minicanfd/libcanbus.so",
+    linux_channels={0: (0, 1), 1: (0,)},
+)
+```
+
+上例明确声明设备 0 有通道 0/1、设备 1 有通道 0，不能直接照搬为所有适配器的布局。
+未提供布局的已扫描设备逐项返回 `layout` 诊断，**不会自动猜测通道**；空序列表示
+有意跳过该设备。指定但未扫描到的设备同样给出诊断。用户提供的通道必须已经确认
+存在，SDK 只查询这些通道的类型：`1` 才列入 FD 通道，`0` 为经典 CAN、`2` 为 LIN。
+未知类型或查询失败会保留诊断，并继续检查其余通道。Windows 不接受 `linux_channels`。
+
+带显式 Init/Exit 的 Linux 库使用 `CAN_GetCHType(devNum, chNum)`；Windows 使用
+`CAN_GetDevType(devNum)`，并接受已核实的 DLL 导出拼写 `CAN_GeDevType`。
+同时支持当前 HCANFD Mini-I 配套的旧 Linux 库：该 ABI 同时缺少 Init/Exit 和
+`CAN_GetCHType`，通过单参数 `CAN_GetDevType(device_index)` 读取设备类型，生命周期
+由库内部管理。它仍要求明确提供 `linux_channels`，目前只支持已确认的通道 0；
+不会把设备类型推广到未经验证的其他通道。两只已确认设备可传
+`linux_channels={0: (0,), 1: (0,)}`。
+
+旧版设备级函数不能替代带 Init/Exit 的库所缺失的 `CAN_GetCHType`。只导出 Init/Exit
+其中一个，或不符合上述已核实导出组合的库，仍返回诊断，不静默忽略生命周期要求。
+
+枚举与本进程的打开/关闭操作协调。同一库仍有打开或关闭失败待清理的通道时，
+返回 `busy` 诊断，不刷新厂商全局枚举表；先完成已有连接的关闭再重扫。
+打开同一库的第二个设备或其他已确认通道时，复用首个连接的扫描快照，不再次调用
+`CAN_ScanDevice()`。超出快照的设备索引会被拒绝；插拔后应关闭全部旧连接再重扫，
+不能在旧连接仍存活时更新索引。最后一个通道成功关闭才使快照失效。
+它不调用可能内部打开/关闭 USB 的 `CAN_ReadDevInfo`，也不保证其他进程未占用设备。
+Linux 扫描借用共享 Init/Exit 引用；Exit 失败保留待清理的库状态，返回 `cleanup`
+诊断，后续枚举或打开会先重试清理，成功前不会再次 Init。扫描索引可能因插拔而改变，
+枚举到通道也不等于它当前可打开，调用方仍须处理实际连接失败并验证目标设备身份。
+
 ## ABI 和通道语义
 
 依据厂商《动态库接口函数使用说明》Windows/Linux V1.3，结构体相同，但函数参数不同：
 
 | 接口 | Windows HCanbus.dll | Linux libcanbus.so |
 | --- | --- | --- |
-| 进程初始化 / 退出 | DLL 不导出 `LibCANbus_Init/Exit`，不调用 | 共享 Init/Exit 生命周期 |
+| 进程初始化 / 退出 | DLL 不导出 `LibCANbus_Init/Exit`，不调用 | 有导出时共享 Init/Exit；已核实旧 ABI 由库内部管理 |
 | 扫描 | `CAN_ScanDevice()` | `CAN_ScanDevice()` |
 | 打开 / 关闭 | `CAN_OpenDevice(devNum)` / `CAN_CloseDevice(devNum)` | 相同函数名，参数为 `(device_index, channel_index)` |
 | FD 初始化 | `CANFD_Init(devNum, config*)` | `CANFD_Init(device_index, channel_index, config*)` |
@@ -62,8 +130,10 @@ Windows 的 `device_index` 对应 DLL 枚举的**通道编号**，`channel_index
 
 打开/初始化失败保留原始原因。若初始化之后的关闭也失败，SDK 保留该句柄，后续
 `close()` 或 `recover()` 重试清理；共享连接池不会把这个失败项当成已经释放。
-成功恢复不重发历史命令。正常关闭会等待在途收发结束，Linux 最后一个用户关闭后
-才释放进程级资源。库句柄不主动卸载。
+成功恢复不重发历史命令。正常关闭会等待在途收发结束，有显式 Init/Exit 的 Linux 库
+在最后一个用户关闭后才释放进程级资源。库句柄不主动卸载。
+若通道已关闭但 `LibCANbus_Exit` 失败，`close()` 仍报错并保留清理重试；再次关闭只重试
+尚未完成的库清理，不重复关闭通道或扣减引用，也不会影响随后已打开的新连接。
 
 本地回归覆盖两套函数参数、结构体二进制布局、单帧/批量收发、DLL 路径和依赖目录、
 初始化失败与清理重试。CI 提供 Windows/Linux、Python 3.10/3.13 的无硬件测试。

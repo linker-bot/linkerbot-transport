@@ -238,24 +238,21 @@ class ManagedMessageTransport(Generic[MessageT]):
             dispatcher = self._require_open_locked()
             generation = self._generation
         data_size = self._measure_data_size(message)
+        receipt = SendReceipt(generation=generation, monotonic=self._monotonic)
+        receipt._claim()
         try:
             dispatcher.send_now(message)
         except Exception as error:
             classified = self._record_error(error, faulted=False)
-            return SendReceipt.failed(
-                classified,
-                generation=generation,
-                monotonic=self._monotonic,
-            )
+            receipt._fail(classified)
+            return receipt
         with self._state_lock:
             self._last_successful_tx_s = self._monotonic()
             self._tx_frames += 1
             self._tx_bytes += data_size
             self._consecutive_errors = 0
-        return SendReceipt.completed(
-            generation=generation,
-            monotonic=self._monotonic,
-        )
+        receipt._dispatch()
+        return receipt
 
     def subscribe_route(
         self,

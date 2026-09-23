@@ -1,6 +1,12 @@
 from linkerbot_transport.receipts import SendOutcome, SendReceipt, SendResult
 from linkerbot_transport.routing import CANRouteKey, RoutedMessage, RouteSubscription
 
+from .enumeration import (
+    MiniCANFDChannel,
+    MiniCANFDEnumerationFailure,
+    MiniCANFDEnumerationResult,
+    enumerate_minicanfd_channels,
+)
 from .transport import (
     CANFDTransport,
     CANFDTransportKey,
@@ -24,6 +30,9 @@ __all__ = [
     "CANRouteKey",
     "CANFDTransport",
     "CANFDTransportKey",
+    "MiniCANFDChannel",
+    "MiniCANFDEnumerationFailure",
+    "MiniCANFDEnumerationResult",
     "PythonCANFDTransport",
     "PythonCANFDTransportKey",
     "RouteSubscription",
@@ -34,5 +43,6 @@ __all__ = [
     "SocketCANFDTransport",
     "SocketCANFDTransportKey",
     "dlc_to_length",
+    "enumerate_minicanfd_channels",
     "length_to_dlc",
 ]

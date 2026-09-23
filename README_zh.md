@@ -14,6 +14,9 @@ CAN、厂商 CAN FD 和 Linux SocketCAN FD 实现，以及传输边界需要的�
 Windows MiniCANFD 通过 `CANFDTransport` 使用厂商 `HCanbus.dll`。
 其 ABI 使用单一枚举通道号，与 Linux 的设备/通道二级索引不同。
 当前源码的 Windows 修复、驱动要求和通道语义见 [MiniCANFD 说明](docs/minicanfd.md)。
+当前源码还提供 `enumerate_minicanfd_channels()` 枚举 FD 适配器通道。
+Windows 使用厂商返回的通道编号；Linux 扫描仅返回设备数，需提供已确认的通道布局。
+此接口不发送 CAN 帧、不识别手型号，尚未包含在 1.0.0 发布包中。
 
 只安装应用需要的后端：
 

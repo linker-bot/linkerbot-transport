@@ -4,6 +4,32 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Report MiniCANFD library Exit failures from close and retain explicit cleanup
+  retries. Release each lifecycle reference once, so an old close retry cannot
+  tear down a new connection or close an already released channel again.
+
+- Record synchronous send claims before entering the backend. Preserve the same
+  receipt through success or failure so replies received during a send remain
+  newer than its claim timestamp.
+
+- Reuse the MiniCANFD scan snapshot when opening additional channels, including
+  while another channel is pending close. Reject new indices until all channels
+  close, so opening a connection cannot bypass enumeration's rescan guard.
+
+- Support the verified legacy Linux MiniCANFD device API used by HCANFD Mini-I
+  libraries without Init/Exit exports. Enumerate explicitly confirmed channel 0
+  with its single-argument device type query; reject partial lifecycle exports
+  and unsupported legacy channel layouts.
+
+- Add frame-free MiniCANFD channel enumeration for Windows and Linux. Return
+  native FD channel coordinates and library paths with structured diagnostics;
+  require confirmed Linux channel layouts where the vendor API only reports
+  device counts. Protect live/pending-close channels from rescans.
+
+- Share vendor library ownership across system-loader names and absolute paths.
+  Retain failed Linux library cleanup for retry before another initialization
+  and coordinate enumeration with channel opening and cleanup.
+
 - Preserve valid frames received before a later error in python-can CAN FD
   batches, including SocketCAN FD. Return the valid prefix, then report the
   pending receive/conversion error once before reading further frames. Keep

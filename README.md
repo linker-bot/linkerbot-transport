@@ -16,6 +16,11 @@ Windows MiniCANFD uses `CANFDTransport` with the vendor's `HCanbus.dll`.
 Its ABI uses one enumerated channel number, unlike Linux's device/channel pair.
 See [MiniCANFD setup, ABI and validation](docs/minicanfd.md) for the source-only
 Windows changes, driver requirements and precise channel semantics.
+The source checkout also provides `enumerate_minicanfd_channels()` for FD
+adapter channels. Windows enumerates native channel numbers; Linux requires
+confirmed channel layouts because the vendor scan only reports device counts.
+This API does not send CAN frames or identify connected hands and is not yet
+included in release 1.0.0.
 
 Install only the backend required by the application:
 
