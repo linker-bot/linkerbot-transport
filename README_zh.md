@@ -1,152 +1,89 @@
 # linkerbot-transport
 
-当前源码提供 PCAN/SLCAN 通道枚举及明确的驱动诊断，见
-[适配器枚举说明](docs/adapter-enumeration.md)。串口候选与 FD 固件能力分别判断。
+`linkerbot-transport` 是 Linkerbot 设备 SDK 共用的物理通信层，提供经典 CAN、
+CAN FD、精确接收路由、可观测发送回执、共享连接租约和有界发送调度。
 
-[English](https://gitea.linkerhub.work/zhuzhixiang/linkerbot-transport/src/branch/main/README.md) |
-[简体中文](README_zh.md)
-
-`linkerbot-transport` 是 Linkerbot 设备 SDK 共用的物理通信层。当前提供经典
-CAN、厂商 CAN FD 和 Linux SocketCAN FD 实现，以及传输边界需要的稳定异常、
-精确接收路由、发送回执、共享连接和有界发送调度能力。
+[English](README.md)
 
 本包不依赖 ROS、灵巧手型号、机械臂型号或运动学库。
 
-## 安装
+## 安装当前源码
 
-Windows MiniCANFD 通过 `CANFDTransport` 使用厂商 `HCanbus.dll`。
-其 ABI 使用单一枚举通道号，与 Linux 的设备/通道二级索引不同。
-当前源码的 Windows 修复、驱动要求和通道语义见 [MiniCANFD 说明](docs/minicanfd.md)。
-当前源码还提供 `enumerate_minicanfd_channels()` 枚举 FD 适配器通道。
-Windows 使用厂商返回的通道编号；Linux 扫描仅返回设备数，需提供已确认的通道布局。
-此接口不发送 CAN 帧、不识别手型号，尚未包含在 1.0.0 发布包中。
+当前 hand 和 transport 版本尚未发布到包仓库。需要同时对两个源码仓库使用 editable
+安装，这样修改会立即生效。以下命令假设两个仓库位于 `~/src`，并创建名为
+`py-linkerbot` 的虚拟环境：
 
-只安装应用需要的后端：
+### uv
+
+```bash
+cd ~/src
+uv venv py-linkerbot --python 3.12
+source py-linkerbot/bin/activate
+
+uv pip install -e "./linkerbot-transport[all]"
+uv pip install -e ./linkerbot-hand
+```
+
+Windows PowerShell 激活环境使用 `./py-linkerbot/Scripts/Activate.ps1`，然后执行上面的
+两个安装命令。
+
+### pip
+
+```bash
+cd ~/src
+python3.12 -m venv py-linkerbot
+source py-linkerbot/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+
+python -m pip install -e "./linkerbot-transport[all]"
+python -m pip install -e ./linkerbot-hand
+```
+
+确认导入路径来自源码目录：
+
+```bash
+python -c "import linkerbot_hand, linkerbot_transport; print(linkerbot_hand.__file__); print(linkerbot_transport.__file__)"
+```
+
+### 安装已发布版本
+
+按应用使用的后端安装：
 
 ```bash
 python -m pip install \
   --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
   --extra-index-url https://pypi.org/simple \
   "linkerbot-transport[can]==1.0.0"
+```
+
+python-can SLCAN/CAN FD 使用 `canfd`；只使用公共异常和并发原语时安装基础包：
+
+```bash
 python -m pip install \
   --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
   --extra-index-url https://pypi.org/simple \
   "linkerbot-transport[canfd]==1.0.0"
-```
 
-如果只需要异常类型和通用并发契约，可以安装不带 `python-can` 的基础包：
-
-```bash
 python -m pip install \
   --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
   "linkerbot-transport==1.0.0"
 ```
 
-## 公共 API
+## 后端选择
 
-### Windows PCAN / 经典 CAN
+| 总线 | 入口 | 常见通道 | 平台 |
+| --- | --- | --- | --- |
+| 经典 CAN | `CANTransport` | `can0`、`PCAN_USBBUS1` | Linux SocketCAN、Windows PCAN |
+| 厂商 CAN FD | `CANFDTransport` | MiniCANFD 设备/通道 | Windows、Linux |
+| python-can CAN FD | `PythonCANFDTransport` | `COM5`、`/dev/ttyACM0` | SLCAN FD 与 python-can 后端 |
+| Linux SocketCAN FD | `SocketCANFDTransport` | `can0` | Linux |
 
-安装 PEAK 的 PCAN 驱动与匹配 Python 进程位数的 PCAN-Basic，并安装本包的
-`can` extra。直接指定 PCAN 通道，无需 Linux 网络接口：
+后端配置、适配器依赖、帧转换和验证见[后端配置](docs/python-can.md)、
+[MiniCANFD](docs/minicanfd.md)和[适配器枚举](docs/adapter-enumeration.md)。
 
-```python
-from linkerbot_transport.can import CANTransport
+## 最小生命周期
 
-transport = CANTransport(
-    "PCAN_USBBUS1", "pcan", bitrate=1_000_000,
-    bus_options={"auto_reset": True},
-)
-transport.open()
-try:
-    health = transport.get_health()
-finally:
-    transport.close()
-```
-
-`CANTransport("can0")` 继续使用 python-can 的 Linux SocketCAN 后端。
-Linux 链路速率由系统配置，`bitrate` 参数不会重新配置现有内核接口。
-构造阶段不进行设备 I/O，驱动在 `open()` 时加载，失败保留原始异常原因。
-
-`bitrate`、`receive_own_messages` 和 `bus_options` 的快照都会进入连接键。
-后端选项仅接受字符串、数字、布尔值或 `None`；通道、后端和波特率使用具名参数。
-不接受会重写通道的 PCAN `device_id`，请明确选择通道。忽略 python-can 的环境变量
-和配置文件，避免运行参数与连接键不一致。同一进程中已打开通道的配置冲突会在再次
-打开驱动前报错。相同配置使用 `SharedTransportPool` 配合 `transport.pool_key`
-复用连接；这不是跨进程锁。
-
-虚拟总线和驱动桩测试覆盖参数、路由、恢复和清理。Windows 实机兼容性和控制频率
-仍需在目标 PCAN 适配器及 Windows 驱动上验收。
-
-### python-can / SLCAN CAN FD
-
-当前源码新增 `PythonCANFDTransport`（尚未包含在 1.0.0 发布包中）。使用
-`python -m pip install -e ".[canfd]"` 安装，extra 包含 pyserial。
-Windows 指定 COM 口；适配器固件须实现 CANable 2.0 的 SLCAN FD 扩展：
-
-```python
-from linkerbot_transport.canfd import PythonCANFDTransport
-
-transport = PythonCANFDTransport(
-    "COM5", "slcan", bitrate=1_000_000, data_bitrate=5_000_000,
-    bus_options={"tty_baudrate": 1_000_000},
-)
-```
-
-沿用相同的生命周期、路由、`CANFDMessage` 与发送回执。`0x04` 表示 FD 不开 BRS，
-需要 BRS 时显式设置 `frame_type=0x0C`。SLCAN 会把双速率转换为 python-can 所需的
-`BitTimingFd`，目前数据速率支持 2 / 5 Mbps。普通仅支持经典 CAN 的 SLCAN 固件无法
-收发 FD。串口波特率与 CAN 速率不同，也不等于可达到的轮询频率。
-完整配置和验收步骤见 [python-can 后端说明](docs/python-can.md)。
-
-`SocketCANFDTransport` 保留 Linux 链路校验和显式重新配置，共用帧转换实现。
-`PythonCANFDTransport(..., "socketcan")` 同样校验已有链路，不自动修改接口。
-适配层不增加转发线程，保留现有的接收线程、内部 FD 队列线程和公共同步发送路径。
-
-### 生命周期与路由
-
-唯一公共命名空间是 `linkerbot_transport`。经典 CAN 和 CAN FD 应用都应构造
-具有显式生命周期的 Transport：
-
-```python
-from linkerbot_transport.can import CANTransport
-from linkerbot_transport.canfd import (
-    CANFDMessage,
-    CANFDTransport,
-    SocketCANFDTransport,
-)
-```
-
-本包不再提供历史上的 `linkerbot.comm`、`linkerbot.exceptions`、
-`linkerbot.queue` 或 `linkerbot.relay` 命名空间。自动启动的 dispatcher
-只是内部通道 worker，不属于用户 API。设备 SDK 和应用只能使用
-`CANTransport`、`CANFDTransport` 或 `SocketCANFDTransport`。
-
-稳定异常位于 `linkerbot_transport.errors`。调用方应捕获所需的最具体异常；
-需要统一映射错误时，可以在最后一层捕获公共基类 `LinkerbotError`：
-
-```python
-from linkerbot_transport.errors import (
-    LinkerbotError,
-    TimeoutError,
-    TransportError,
-)
-
-try:
-    result = receipt.result(timeout=0.1)
-except TimeoutError:
-    # 有界等待超时；receipt 之后仍可能完成。
-    ...
-except TransportError:
-    # 物理后端拒绝发送或发送失败。
-    ...
-except LinkerbotError:
-    # 在最终边界处理参数、生命周期和队列错误。
-    ...
-```
-
-## 生命周期
-
-构造 Transport 不会打开设备，也不会启动工作线程。连接必须由调用方显式管理：
+构造阶段不产生设备副作用。`open()` 获取后端并启动传输，使用 `finally` 关闭：
 
 ```python
 from linkerbot_transport.can import CANTransport
@@ -155,195 +92,20 @@ transport = CANTransport("can0")
 transport.open()
 try:
     health = transport.get_health()
+    print(health.state, health.generation)
 finally:
     transport.close()
 ```
 
-打开期间发生 `KeyboardInterrupt` 或 worker 启动失败时会回滚资源，并保留原始中断。
-若清理失败，连接保持 faulted 并持有 dispatcher，可再次调用 `close()`；释放完成前不会
-重新打开。关闭失败或被中断不会标记为 closed，清理不会重放运动指令。
+PCAN 和 SLCAN 使用相同的生命周期，只需替换通道和后端参数。MiniCANFD 的配置和
+通道枚举使用对应后端文档中的入口。
 
-`open()` 和 `close()` 幂等。`recover()` 会替换连接、增加连接代次并关闭旧路由，
-不会重放旧代次中的控制帧。恢复后必须重新注册接收路由。
+## 公共 API 概览
 
-多个设备共用同一个物理通道时，使用 `SharedTransportPool`。第一个 lease 打开
-Transport，最后一个 lease 关闭 Transport，从而避免重复建立总线连接。
-如果打开或最后一次关闭失败且清理未完成，池保留该 Transport，租约数为零。
-后续同 key 的 `acquire()` 会先恢复原对象，不会调用新的 factory 绕过清理。
-打开失败后若已完成清理，则 `active_keys()` 不保留该条目。
+Transport 从 `linkerbot_transport.can` 和 `linkerbot_transport.canfd` 导入；
+公共契约、异常、路由、回执、`SharedTransportPool` 和 `TransmitArbiter` 从
+`linkerbot_transport` 导入。发送回执表示后端已接收发送请求，不表示设备已经执行。
+接收路由是精确、有界的，并绑定到一个连接代次。
 
-## 精确接收路由
-
-CAN 和 CAN FD 使用精确、独占、有界的接收路由，不向所有订阅者广播帧。接收线程
-从帧中提取一次 key，执行一次哈希查找，再把帧放入对应路由的有界 inbox。
-经典 CAN 的 key 由完整仲裁 ID 和标准帧/扩展帧标志共同组成：
-
-```python
-import can
-
-from linkerbot_transport.can import CANRouteKey, CANTransport
-
-transport = CANTransport("can0")
-transport.open()
-route = transport.subscribe_route(
-    CANRouteKey(arbitration_id=0x28, is_extended_id=False),
-    queue_capacity=64,
-)
-try:
-    receipt = transport.send(
-        can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
-    )
-    receipt.result(timeout=0.1)
-    received = route.receive(timeout_s=0.02)
-    assert received.generation == transport.get_health().generation
-finally:
-    route.close()
-    transport.close()
-```
-
-协议响应分布在多个仲裁 ID 时，可以原子注册一组路由：
-
-```python
-routes = transport.subscribe_routes(
-    (
-        CANRouteKey(arbitration_id=0x02000000, is_extended_id=True),
-        CANRouteKey(arbitration_id=0x02006000, is_extended_id=True),
-    ),
-    queue_capacity=64,
-)
-```
-
-容量限制作用于整组数据流。注册要么一次取得全部 key，要么一个也不取得；关闭订阅
-会释放整组 key。所有命中帧按到达顺序进入同一个队列。
-
-SDK actor 可在订阅时传入 `on_available=event.set`。空路由首次变为可读，以及路由关闭
-或中止时，都会以边沿方式通知 actor，使其可以直接消费 Transport 队列，不再增加第二层
-mailbox 线程。回调在路由路径同步执行，必须立即返回，不能执行协议事务或阻塞；回调抛出
-异常时会记录日志并禁用该路由的后续通知，但不会终止 RX。
-
-`RoutedMessage` 包含单调时钟接收时间、连接代次和该代次内的序号。inbox 已满时，
-新帧会被丢弃，同时增加路由和 Transport 的 overflow 计数。路由未命中、key 提取
-错误、旧代次帧、队列深度和关闭时丢帧也都会记录在缓存健康状态中。
-
-## 健康状态
-
-`get_health()` 只读取缓存，不产生设备 I/O。它同时报告连接状态、连接代次、最近错误、
-连续错误、重连次数、路由状态，以及整个物理通道跨连接代次累计的 `tx_frames`、
-`rx_frames`、`tx_bytes` 和 `rx_bytes`。
-
-发送计数只在物理后端成功接收帧后增加。接收计数在后端交出帧时增加，即使之后发生
-路由未命中、队列溢出或旧代次拒绝。字节数只计算 DLC 对应的数据字段，不包含仲裁、
-CRC、位填充和帧间隔，因此不能直接视为 CAN 总线利用率。
-
-关闭、中止或恢复 Transport 会关闭当前全部路由并唤醒阻塞中的接收方。旧 callback
-代次到达的帧仍会计入统计，但不会投递到新路由。
-
-## 发送回执
-
-每次 `transport.send()` 都返回 `SendReceipt`。完成表示物理后端已经接收发送请求，
-而不是仅仅进入软件队列。需要确认结果时调用 `receipt.result(timeout=...)`：
-
-- 成功返回 `SendOutcome.DISPATCHED`，并携带连接代次及 accepted、claimed、completed
-  单调时间戳。
-- 被新目标覆盖返回 `SendOutcome.SUPERSEDED`。
-- 物理发送失败抛出稳定的 Transport 异常，同时 receipt 状态为
-  `SendOutcome.FAILED`。
-
-Transport 停止或故障时，所有未完成回执都会失败；控制帧不会被自动重试或在恢复后
-重放。
-
-## 单写入者和 latest-wins
-
-多个设备或命令族共用物理通道时，使用 `TransmitArbiter` 作为唯一写入者。连续控制
-命令使用按 `(endpoint_id, command_family)` 区分的容量 1 latest slot，离散操作使用
-独立的有界 FIFO：
-
-```python
-import time
-
-from linkerbot_transport import TransmitArbiter
-
-transport.open()
-generation = transport.get_health().generation
-arbiter = TransmitArbiter(transport.send, fifo_capacity=32)
-arbiter.open(generation=generation)
-try:
-    angle_receipt = arbiter.submit_latest(
-        angle_frame,
-        endpoint_id="left-hand",
-        command_family="angles",
-        deadline_at_s=time.monotonic() + 0.02,
-    )
-    replacement = arbiter.replace_latest_if_pending(
-        newer_angle_frame,
-        endpoint_id="left-hand",
-        command_family="angles",
-        deadline_at_s=time.monotonic() + 0.02,
-    )
-    clear_fault_receipt = arbiter.submit_fifo(
-        clear_fault_frame,
-        endpoint_id="left-hand",
-    )
-finally:
-    arbiter.close()
-    transport.close()
-```
-
-`deadline_at_s` 是绝对 `time.monotonic()` 截止时间，不是相对 timeout。关闭或中止
-arbiter 会失败旧连接代次的全部待发送任务，重新打开后不会重放。arbiter 健康状态是
-零 I/O 快照，包含 pending、accepted、dispatched、superseded、failed 和容量拒绝计数。
-
-`replace_latest_if_pending()` 只覆盖尚未被 worker 领取的目标；旧目标已经在途或不存在
-时返回 `None`，不会再排入第二个目标，从而保护协议请求与响应的相关性。
-
-已经拥有 I/O actor 的运行时可使用 `TransmitMode.CALLER`，避免再创建常驻 TX worker。
-提交仍然只负责接纳有界任务并返回 receipt，随后由 actor 调用 `drain()` 完成实际发送。
-多个 actor 并发调用时，第一个调用者临时取得单写入权，并继续处理其持有期间新进入的
-任务。`drain()` 会执行 Transport I/O，只能由 I/O actor 调用，不能放在用户或 ROS
-callback 中：
-
-```python
-from linkerbot_transport import TransmitArbiter, TransmitMode
-
-arbiter = TransmitArbiter(transport.send, mode=TransmitMode.CALLER)
-arbiter.open(generation=generation)
-receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
-arbiter.drain()
-receipt.result(timeout=0.1)
-```
-
-## CAN FD 说明
-
-### 整组 FIFO 准入
-
-先完成全部编码，再一次提交一组目标：
-
-```python
-receipt = arbiter.submit_fifo_batch(
-    joint_frames,
-    endpoint_id="arm",
-    deadline_at_s=time.monotonic() + 0.02,
-    max_pending_age_s=0.02,
-)
-```
-
-FIFO 容量按帧计算。七帧空间不足时整组抛 `QueueFullError`，零帧入队。
-可选 `max_pending_age_s` 在排队或正在发送的工作已达到年龄预算时抛 `TimeoutError`；
-它不预测硬件耗时。截止时间只在组内第一帧发送前检查，过期整组失败；已经开始的组
-不会因为截止时间只发送一半。组内不会插入其他排队任务，但物理故障或关闭可能中止
-尚未发送的后缀。通过 `receipt.sent_frames` 查看后端已成功返回的帧数，
-`receipt.frame_count` 查看整组大小。原子准入不代表物理原子执行或电机确认。
-
-`get_health()` 新增 `expired`、`rejected_stale`、`oldest_pending_age_s`（包括正在发送的工作）
-和 `in_flight_frames`（正在处理的一组的总帧数）。待发容量按帧计算，
-accepted/dispatched/failed/expired 按提交计数：七帧一组只记一次。原单帧接口及默认策略不变。
-
-经典 `CANTransport` 直接发送，不再启动闲置的底层队列发送线程。直接使用内部 dispatcher
-仍默认立即启动该线程；设置 `start_send_worker=False` 后，第一次异步 `send()` 才启动它。
-
-CAN FD 批量发送失败时，后端无法可靠判断部分成功数量，因此同一批次的所有 receipt
-都会失败。设备运行时应通过精确有界路由接收数据；内部 worker 不属于 1.0 兼容契约。
-
-CAN FD 消息默认使用 FrameType `0x04`，即启用 FD 但不启用位速率切换。只有设备明确
-支持 BRS 时才设置 `frame_type=0x0C`。`frame_type=None` 表示继承厂商接口配置；
-SocketCAN 继承后端的 `fd` 模式，并保持 BRS 关闭。
+路由订阅、健康指标、发送回执、latest-wins/FIFO 仲裁、批量准入和调用方排空方式见
+[传输运行时](docs/runtime_zh.md)，完整文档列表见[文档索引](docs/README.md)。

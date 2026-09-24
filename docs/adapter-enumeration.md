@@ -1,7 +1,7 @@
 # PCAN / SLCAN 适配器枚举
 
-以下 API 属于当前源码，尚未包含在 1.0.0 发布包。枚举只读取驱动或操作系统信息，
-不打开 CAN 通道或串口，不发送 CAN/SLCAN 指令，不更改速率。
+枚举只读取驱动或操作系统信息，不打开 CAN 通道或串口，不发送 CAN/SLCAN 指令，
+不更改速率。
 
 ```python
 from linkerbot_transport.discovery import (

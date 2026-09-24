@@ -1,7 +1,7 @@
 # MiniCANFD 动态库：Windows 与 Linux
 
-Windows 使用 `HCanbus.dll`，Linux 使用 `libcanbus.so`。以下 Windows 修复属于
-当前源码，尚未包含在 1.0.0 发布包中。不随 Python 包分发厂商二进制或原始协议材料。
+Windows 使用 `HCanbus.dll`，Linux 使用 `libcanbus.so`。厂商二进制和原始协议材料
+不随 Python 包分发。
 
 ## 使用方式
 
@@ -32,8 +32,7 @@ Windows 必须安装厂商 USB 驱动，以及匹配 Python 进程位数的 DLL 
 
 ## 显式枚举 FD 通道
 
-当前源码新增 `enumerate_minicanfd_channels()`，尚未包含在 1.0.0 发布包中。
-它只扫描适配器并查询通道类型，不打开 CAN 通道、不配置速率、不收发 CAN 帧，
+`enumerate_minicanfd_channels()` 只扫描适配器并查询通道类型，不打开 CAN 通道、不配置速率、不收发 CAN 帧，
 不识别连接的灵巧手。导入函数本身不加载动态库。
 
 Windows 扫描返回原生通道编号，可以直接枚举：
@@ -79,14 +78,14 @@ result = enumerate_minicanfd_channels(
 
 带显式 Init/Exit 的 Linux 库使用 `CAN_GetCHType(devNum, chNum)`；Windows 使用
 `CAN_GetDevType(devNum)`，并接受已核实的 DLL 导出拼写 `CAN_GeDevType`。
-同时支持当前 HCANFD Mini-I 配套的旧 Linux 库：该 ABI 同时缺少 Init/Exit 和
-`CAN_GetCHType`，通过单参数 `CAN_GetDevType(device_index)` 读取设备类型，生命周期
-由库内部管理。它仍要求明确提供 `linux_channels`，目前只支持已确认的通道 0；
-不会把设备类型推广到未经验证的其他通道。两只已确认设备可传
+Linux 库也可能提供不含 Init/Exit 和 `CAN_GetCHType` 的设备级 API，通过单参数
+`CAN_GetDevType(device_index)` 读取设备类型，生命周期由库内部管理。该 API 仍要求
+明确提供 `linux_channels`，目前只支持已确认的通道 0；不会把设备类型推广到未经验证的
+其他通道。两只已确认设备可传
 `linux_channels={0: (0,), 1: (0,)}`。
 
-旧版设备级函数不能替代带 Init/Exit 的库所缺失的 `CAN_GetCHType`。只导出 Init/Exit
-其中一个，或不符合上述已核实导出组合的库，仍返回诊断，不静默忽略生命周期要求。
+带 Init/Exit 的库使用 `CAN_GetCHType`；只导出 Init/Exit 其中一个，或不符合上述已核实
+导出组合的库，仍返回诊断，不静默忽略生命周期要求。
 
 枚举与本进程的打开/关闭操作协调。同一库仍有打开或关闭失败待清理的通道时，
 返回 `busy` 诊断，不刷新厂商全局枚举表；先完成已有连接的关闭再重扫。
@@ -104,7 +103,7 @@ Linux 扫描借用共享 Init/Exit 引用；Exit 失败保留待清理的库状�
 
 | 接口 | Windows HCanbus.dll | Linux libcanbus.so |
 | --- | --- | --- |
-| 进程初始化 / 退出 | DLL 不导出 `LibCANbus_Init/Exit`，不调用 | 有导出时共享 Init/Exit；已核实旧 ABI 由库内部管理 |
+| 进程初始化 / 退出 | DLL 不导出 `LibCANbus_Init/Exit`，不调用 | 有导出时共享 Init/Exit；设备级 API 由库内部管理 |
 | 扫描 | `CAN_ScanDevice()` | `CAN_ScanDevice()` |
 | 打开 / 关闭 | `CAN_OpenDevice(devNum)` / `CAN_CloseDevice(devNum)` | 相同函数名，参数为 `(device_index, channel_index)` |
 | FD 初始化 | `CANFD_Init(devNum, config*)` | `CANFD_Init(device_index, channel_index, config*)` |
@@ -130,7 +129,7 @@ Windows 的 `device_index` 对应 DLL 枚举的**通道编号**，`channel_index
 
 打开/初始化失败保留原始原因。若初始化之后的关闭也失败，SDK 保留该句柄，后续
 `close()` 或 `recover()` 重试清理；共享连接池不会把这个失败项当成已经释放。
-成功恢复不重发历史命令。正常关闭会等待在途收发结束，有显式 Init/Exit 的 Linux 库
+成功恢复不重发已提交命令。正常关闭会等待在途收发结束，有显式 Init/Exit 的 Linux 库
 在最后一个用户关闭后才释放进程级资源。库句柄不主动卸载。
 若通道已关闭但 `LibCANbus_Exit` 失败，`close()` 仍报错并保留清理重试；再次关闭只重试
 尚未完成的库清理，不重复关闭通道或扣减引用，也不会影响随后已打开的新连接。

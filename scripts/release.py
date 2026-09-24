@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Release gate and publisher for linkerbot-transport.
 
-A release here is six things staying consistent: the version in
-``pyproject.toml``, a dated section in ``CHANGELOG.md``, the pinned version in
-both READMEs, a signed git tag, the artifacts in the package registry, and a
-Gitea Release carrying those artifacts. The 2.0.0 releases of ``linkerbot-hand``
-and ``linkerbot-hand-ros`` got the first two right, silently missed the next
-three, and then missed the sixth even after the others were repaired. This script
-checks ordering and consistency mechanically instead of relying on memory.
+A release keeps the version in ``pyproject.toml``, the dated
+``CHANGELOG.md`` section, both README install examples, the signed tag, package
+artifacts, and the Gitea Release consistent. This script checks that ordering
+mechanically before creating or publishing a release.
 
 Usage::
 
@@ -58,9 +55,8 @@ SIMPLE_INDEX = f"{REGISTRY}/simple/{PACKAGE}/"
 API = f"{HOST}/api/v1/repos/{OWNER}/{PACKAGE}"
 READMES = ("README.md", "README_zh.md")
 
-# The READMEs pin the package with and without extras
-# (``linkerbot-transport[can]==1.0.0``, ``linkerbot-transport==1.0.0``), so the
-# optional bracket group has to be part of the pattern rather than assumed absent.
+# The READMEs pin the package with and without extras, so the optional bracket
+# group has to be part of the pattern rather than assumed absent.
 PIN = rf"{PACKAGE}(?:\[[^\]]*\])?==([0-9][^'\"\s]*)"
 
 
@@ -383,12 +379,7 @@ def release_notes(version: str) -> str:
 
 
 def create_release(version: str, artifacts: list[Path]) -> None:
-    """Create the Gitea Release and attach the artifacts.
-
-    Every prior version of this package has one, and it is the step the hand and
-    ROS 2.0.0 releases missed even after everything else was repaired: it is the
-    only part that no other gate makes visible.
-    """
+    """Create the Gitea Release for the current version and attach its artifacts."""
 
     tag = f"v{version}"
     status, existing = api_request(f"/releases/tags/{tag}")

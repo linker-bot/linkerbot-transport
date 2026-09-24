@@ -4,6 +4,10 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Reorganize the current-version documentation: keep the root READMEs focused on
+  installation, backend selection and a minimal lifecycle, and move runtime,
+  platform, enumeration and release details into dedicated guides.
+
 - Add public PCAN and SLCAN candidate enumeration with immutable native channel
   descriptors and explicit dependency, driver, busy and missing-port diagnostics.
   Query PCAN through python-can without initializing channels; select only known
