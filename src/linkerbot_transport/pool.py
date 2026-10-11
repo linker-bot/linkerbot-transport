@@ -33,6 +33,7 @@ class TransportLease(Generic[TransportT]):
         self._pool = pool
         self._key = key
         self._transport: TransportT | None = transport
+        self._cleanup_transport: TransportT | None = None
         self._lock = threading.Lock()
 
     @property
@@ -45,14 +46,24 @@ class TransportLease(Generic[TransportT]):
             return self._transport
 
     def close(self) -> None:
-        """Release this reference idempotently."""
+        """Release once, retrying failed idle cleanup without reopening a channel."""
 
         with self._lock:
-            if self._transport is None:
+            release = self._transport is not None
+            transport = self._transport if release else self._cleanup_transport
+            if transport is None:
                 return
-            transport = self._transport
             self._transport = None
-        self._pool._release(self._key, transport)
+            self._cleanup_transport = None
+        try:
+            if release:
+                self._pool._release(self._key, transport)
+            else:
+                self._pool._retry_close(self._key, transport)
+        except BaseException:
+            with self._lock:
+                self._cleanup_transport = transport
+            raise
 
     def __enter__(self) -> TransportT:
         return self.transport
@@ -149,6 +160,16 @@ class SharedTransportPool(Generic[TransportT]):
                 raise
             else:
                 del self._entries[key]
+
+    def _retry_close(self, key: Hashable, transport: TransportT) -> None:
+        """Close only the same idle retained object; never touch a newer owner."""
+
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.transport is not transport or entry.leases > 0:
+                return
+            entry.transport.close()
+            del self._entries[key]
 
 
 __all__ = ["SharedTransportPool", "TransportLease"]

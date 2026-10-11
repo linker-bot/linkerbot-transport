@@ -4,6 +4,11 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Retain failed final-lease cleanup for explicit `close()` retries without
+  reopening channels or decrementing references twice. Serialize retries with
+  pool ownership checks so an old retry never closes a recovered active owner
+  or a replacement entry.
+
 - Reorganize the current-version documentation: keep the root READMEs focused on
   installation, backend selection and a minimal lifecycle, and move runtime,
   platform, enumeration and release details into dedicated guides.

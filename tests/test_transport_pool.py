@@ -148,6 +148,146 @@ def test_failed_final_close_retains_entry_for_recovery() -> None:
     second.close()
 
 
+def test_failed_final_close_can_retry_without_reopening_or_double_releasing():
+    pool = SharedTransportPool[FakeTransport[int]]()
+    lease = pool.acquire("retry", FakeTransport[int])
+    transport = lease.transport
+    generation = transport.get_health().generation
+    transport.current_dispatcher.stop_error = OSError("close failed")
+    with pytest.raises(TransportError):
+        lease.close()
+    assert pool.lease_count("retry") == 0
+    with pytest.raises(ClosedError):
+        _ = lease.transport
+    lease.close()
+    lease.close()
+    assert pool.active_keys() == ()
+    assert transport.get_health().state is TransportState.CLOSED
+    assert transport.get_health().generation == generation
+    assert len(transport.dispatchers) == 1
+
+
+def test_old_close_retry_does_not_close_a_recovered_active_owner():
+    pool = SharedTransportPool[FakeTransport[int]]()
+    old = pool.acquire("shared", FakeTransport[int])
+    transport = old.transport
+    transport.current_dispatcher.stop_error = OSError("close failed")
+    with pytest.raises(TransportError):
+        old.close()
+    current = pool.acquire("shared", lambda: pytest.fail("must recover same object"))
+    old.close()
+    old.close()
+    assert pool.lease_count("shared") == 1
+    assert current.transport is transport
+    assert transport.get_health().state is TransportState.OPEN
+    current.close()
+    assert pool.active_keys() == ()
+
+
+def test_old_close_retry_does_not_touch_a_replacement_pool_entry():
+    pool = SharedTransportPool[FakeTransport[int]]()
+    old = pool.acquire("replace", FakeTransport[int])
+    transport = old.transport
+    transport.current_dispatcher.stop_error = OSError("close failed")
+    with pytest.raises(TransportError):
+        old.close()
+    recovered = pool.acquire("replace", lambda: transport)
+    recovered.close()
+    replacement = pool.acquire("replace", FakeTransport[int])
+    old.close()
+    assert replacement.transport is not transport
+    assert replacement.transport.get_health().state is TransportState.OPEN
+    assert pool.lease_count("replace") == 1
+    replacement.close()
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_interrupted_final_close_remains_retryable(interrupt):
+    pool = SharedTransportPool[FakeTransport[int]]()
+    lease = pool.acquire("interrupt", FakeTransport[int])
+    transport = lease.transport
+    error = interrupt("close interrupted")
+    transport.current_dispatcher.stop_error = error
+    with pytest.raises(interrupt) as captured:
+        lease.close()
+    assert captured.value is error
+    lease.close()
+    assert pool.active_keys() == ()
+
+
+def test_close_callback_can_reenter_the_same_lease_without_deadlock():
+    pool = SharedTransportPool[FakeTransport[int]]()
+
+    class CallbackTransport(FakeTransport[int]):
+        callback = None
+
+        def close(self):
+            if self.callback is not None:
+                self.callback()
+            super().close()
+
+    lease = pool.acquire("callback", CallbackTransport)
+    lease.transport.callback = lease.close
+    lease.close()
+    assert pool.active_keys() == ()
+
+
+def test_acquire_waits_for_an_in_progress_cleanup_retry():
+    pool = SharedTransportPool[FakeTransport[int]]()
+    old = pool.acquire("serialized-retry", FakeTransport[int])
+    transport = old.transport
+    transport.current_dispatcher.stop_error = OSError("close failed")
+    with pytest.raises(TransportError):
+        old.close()
+    entered = threading.Event()
+    release = threading.Event()
+    acquired = threading.Event()
+    started_acquire = threading.Event()
+    original_close = transport.close
+    leases = []
+    errors = []
+
+    def close():
+        entered.set()
+        assert release.wait(3)
+        original_close()
+
+    transport.close = close
+
+    def retry():
+        try:
+            old.close()
+        except BaseException as error:
+            errors.append(error)
+
+    def acquire():
+        started_acquire.set()
+        try:
+            leases.append(pool.acquire("serialized-retry", FakeTransport[int]))
+            acquired.set()
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=retry)
+    second = threading.Thread(target=acquire)
+    first.start()
+    try:
+        assert entered.wait(3)
+        second.start()
+        assert started_acquire.wait(3)
+        assert not acquired.wait(0.05)
+    finally:
+        release.set()
+        first.join(3)
+        if second.ident is not None:
+            second.join(3)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors and acquired.is_set()
+    assert leases[0].transport is not transport
+    assert pool.lease_count("serialized-retry") == 1
+    leases[0].close()
+
+
 @pytest.mark.parametrize("new_factory", [False, True])
 def test_failed_open_and_cleanup_recover_same_transport(new_factory: bool) -> None:
     pool = SharedTransportPool[ManagedMessageTransport[int]]()

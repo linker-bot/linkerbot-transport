@@ -22,8 +22,12 @@ previous commands. Register routes again after recovery.
 
 Use `SharedTransportPool` when several SDK devices share one physical channel.
 The first lease opens the transport and the final lease closes it. A transport
-whose cleanup is still pending remains in the pool for the next matching
-`acquire()` to recover.
+whose cleanup is still pending remains in the pool. The releasing lease can
+retry `close()` to finish idle cleanup without reopening the channel or releasing
+the same reference twice. Its `transport` property remains closed after the
+reference was released. A later matching `acquire()` can still recover the
+retained object; an old lease retry never closes a recovered active owner or a
+replacement entry.
 
 ## Exact receive routes
 
