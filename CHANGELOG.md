@@ -4,6 +4,15 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Default Linux MiniCANFD enumeration to channel 0 on every scanned adapter,
+  including the verified legacy device API. When channel 0 cannot be enumerated
+  as FD, check channel 1 where the ABI supports it and report failures when
+  neither channel is available. Derive adapter count from the vendor scan;
+  retain strict explicit layouts, FD type checks and lifecycle diagnostics
+  without an additional scan.
+- Clarify how the hand SDK separately requests channel 1 enumeration after an
+  unanswered channel 0 identity probe, retaining legacy channel restrictions.
+
 - Retain failed final-lease cleanup for explicit `close()` retries without
   reopening channels or decrementing references twice. Serialize retries with
   pool ownership checks so an old retry never closes a recovered active owner

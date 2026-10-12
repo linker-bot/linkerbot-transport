@@ -1,8 +1,10 @@
 """Explicit, frame-free MiniCANFD adapter enumeration.
 
 The vendor Linux ABI reports devices, but does not expose their channel count.
-Only caller-confirmed channel layouts are inspected on that platform. Windows
-reports channel numbers directly. Neither path opens or initializes a CAN bus.
+Linux starts at channel 0 on every scanned device, falling back to channel 1
+when channel 0 cannot be enumerated as FD, or uses an explicit layout. Windows
+reports channel numbers directly. Neither path opens or initializes a
+CAN bus.
 """
 
 from __future__ import annotations
@@ -59,12 +61,14 @@ def enumerate_minicanfd_channels(
 ) -> MiniCANFDEnumerationResult:
     """Scan once without opening channels or sending CAN messages.
 
-    On Linux, ``linux_channels={0: (0, 1)}`` explicitly declares that scanned
-    device 0 has channels 0 and 1 according to its confirmed specification.
-    Unspecified devices produce layout diagnostics, not guessed channels.
-    Empty channel sequences intentionally skip a device. Type queries filter
-    out classic CAN and LIN channels. Windows rejects ``linux_channels`` and
-    checks each DLL-enumerated devNum instead.
+    On Linux, omitted ``linux_channels`` selects channel 0 on every scanned
+    device; if channel 0 is not FD or its type query fails, check channel 1.
+    Callers need not know the adapter count. An explicit mapping such
+    as ``{0: (0, 1)}`` declares confirmed channels instead. Under that explicit
+    policy, unspecified devices produce layout diagnostics and empty channel
+    sequences intentionally skip a device. Type queries filter out classic CAN
+    and LIN channels. Windows rejects ``linux_channels`` and checks each
+    DLL-enumerated devNum instead.
 
     Invalid configuration raises ``ValidationError`` before loading a library.
     Library, driver and cleanup failures are retained in ``result.failures``;
@@ -79,7 +83,7 @@ def enumerate_minicanfd_channels(
     windows = platform_name == "Windows"
     if windows and linux_channels is not None:
         raise ValidationError("linux_channels is only valid on Linux")
-    layouts = _normalize_layouts(linux_channels)
+    layouts: dict[int, tuple[int, ...]] = _normalize_layouts(linux_channels)
     try:
         lib = backend._load_library(library_path)
         backend._bind_signatures(lib, windows=windows)
@@ -110,8 +114,17 @@ def enumerate_minicanfd_channels(
             except Exception as error:
                 failures.append(MiniCANFDEnumerationFailure("scan", _as_error(error)))
             else:
+                if not windows and linux_channels is None:
+                    layouts = {device_index: (0,) for device_index in range(count)}
                 _inspect_channels(
-                    lib, count, windows, layouts, resolved_path, channels, failures
+                    lib,
+                    count,
+                    windows,
+                    layouts,
+                    resolved_path,
+                    channels,
+                    failures,
+                    fallback_channel_one=not windows and linux_channels is None,
                 )
         finally:
             cleanup_error = backend._lifecycle_release(lifecycle_ref)
@@ -160,6 +173,8 @@ def _inspect_channels(
     library_path: str,
     channels: list[MiniCANFDChannel],
     failures: list[MiniCANFDEnumerationFailure],
+    *,
+    fallback_channel_one: bool = False,
 ) -> None:
     candidates = []
     for device_index in range(count):
@@ -215,6 +230,7 @@ def _inspect_channels(
             )
             continue
         args = (device_index,) if device_level else (device_index, channel_index)
+        channel_type = None
         try:
             channel_type = get_type(*args)
             if channel_type not in (0, 1, 2):
@@ -227,9 +243,23 @@ def _inspect_channels(
                     "type", _as_error(error), device_index, channel_index
                 )
             )
-            continue
         if channel_type == 1:
             channels.append(MiniCANFDChannel(device_index, channel_index, library_path))
+        elif fallback_channel_one:
+            if channel_index == 0:
+                # Add at most one alternative per adapter; never guess beyond 1.
+                candidates.append((device_index, 1))
+            elif channel_type in (0, 2):
+                failures.append(
+                    MiniCANFDEnumerationFailure(
+                        "type",
+                        TransportError(
+                            "MiniCANFD channels 0 and 1 could not be enumerated as FD"
+                        ),
+                        device_index,
+                        channel_index,
+                    )
+                )
 
 
 def _bind_channel_type(lib: Any, windows: bool) -> tuple[Any, str]:

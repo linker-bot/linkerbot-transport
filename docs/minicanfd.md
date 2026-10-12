@@ -59,30 +59,39 @@ for channel in result.channels:
 只有经典 CAN/LIN 通道、库缺失、扫描失败和布局未知是不同情况。
 
 Linux V1.3 的 `CAN_ScanDevice()` 只返回物理设备数，`Dev_Info` 没有通道总数，
-`CAN_GetCHType(devNum, chNum)` 也未定义越界查询的有效范围。当前可用资料未提供
-可可靠识别型号及其通道数的完整对应表。因此需要按厂商规格或已确认的接线提供
-`linux_channels`，不能由“扫描到 1 个设备”推断出 2 个通道：
+`CAN_GetCHType(devNum, chNum)` 也未定义越界查询的有效范围。默认接线约定为每块
+适配器先检查通道 0：省略 `linux_channels` 时，按实际扫描数量检查所有适配器的
+通道 0，无需提前知道数量。通道 0 不是 FD 或类型查询失败时，继续检查通道 1；
+若两路都不能枚举为 FD，则返回诊断，不尝试更大的通道编号。例如扫描到三块适配器时，
+首先检查
+`(0, 0)`、`(1, 0)`、`(2, 0)`：
 
 ```python
 result = enumerate_minicanfd_channels(
     "/opt/minicanfd/libcanbus.so",
-    linux_channels={0: (0, 1), 1: (0,)},
 )
 ```
 
-上例明确声明设备 0 有通道 0/1、设备 1 有通道 0，不能直接照搬为所有适配器的布局。
-未提供布局的已扫描设备逐项返回 `layout` 诊断，**不会自动猜测通道**；空序列表示
-有意跳过该设备。指定但未扫描到的设备同样给出诊断。用户提供的通道必须已经确认
-存在，SDK 只查询这些通道的类型：`1` 才列入 FD 通道，`0` 为经典 CAN、`2` 为 LIN。
+上述 transport 枚举只查询适配器和通道类型，不判断是否接有手。`linkerbot-hand`
+的默认身份发现先探测通道 0，无身份候选且探测连接已成功关闭时，才显式请求枚举
+同一适配器的通道 1。若通道 0 在类型检查阶段已被排除，底层默认枚举直接检查通道 1；只有通过 FD 类型检查的通道才会继续身份探测。两路都无候选
+由 hand SDK 在报告中返回 `no_hand_found`。旧版设备级库仍只支持通道 0，不因上层
+回退而放宽限制；枚举失败、占用和清理异常均保留诊断。
+
+需要覆盖默认选择时，按厂商规格或已确认的接线显式提供 `linux_channels`，例如
+`{0: (0, 1), 1: (0,)}` 表示设备 0 的通道 0/1、设备 1 的通道 0。显式映射保持严格
+行为：未配置的已扫描设备逐项返回 `layout` 诊断，空序列表示有意跳过该设备，
+指定但未扫描到的设备同样给出诊断。`linux_channels={}` 不会启用默认布局。
+默认通道 0 或显式配置的其他通道都需要经过类型检查：`1` 才列入 FD 通道，
+`0` 为经典 CAN、`2` 为 LIN。
 未知类型或查询失败会保留诊断，并继续检查其余通道。Windows 不接受 `linux_channels`。
 
 带显式 Init/Exit 的 Linux 库使用 `CAN_GetCHType(devNum, chNum)`；Windows 使用
 `CAN_GetDevType(devNum)`，并接受已核实的 DLL 导出拼写 `CAN_GeDevType`。
 Linux 库也可能提供不含 Init/Exit 和 `CAN_GetCHType` 的设备级 API，通过单参数
-`CAN_GetDevType(device_index)` 读取设备类型，生命周期由库内部管理。该 API 仍要求
-明确提供 `linux_channels`，目前只支持已确认的通道 0；不会把设备类型推广到未经验证的
-其他通道。两只已确认设备可传
-`linux_channels={0: (0,), 1: (0,)}`。
+`CAN_GetDevType(device_index)` 读取设备类型，生命周期由库内部管理。该 API 同样默认
+检查每块适配器的通道 0，目前只支持该通道；显式指定其他通道时仍报告 `layout`，
+不会把设备类型推广到其他通道。
 
 带 Init/Exit 的库使用 `CAN_GetCHType`；只导出 Init/Exit 其中一个，或不符合上述已核实
 导出组合的库，仍返回诊断，不静默忽略生命周期要求。

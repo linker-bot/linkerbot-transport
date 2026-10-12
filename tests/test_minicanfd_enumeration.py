@@ -190,18 +190,46 @@ def test_linux_uses_only_declared_channels_and_filters_classic_and_lin(library_f
     assert_no_channel_io(lib)
 
 
-def test_linux_does_not_guess_unreported_channel_count(library_factory):
-    lib = library_factory()
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_linux_defaults_to_channel_zero_on_every_scanned_adapter(
+    library_factory, legacy, count
+):
+    lib = library_factory(legacy=legacy)
+    lib.CAN_ScanDevice.result = count
 
     result = enumerate_minicanfd_channels()
+
+    assert result.failures == ()
+    assert [(item.device_index, item.channel_index) for item in result.channels] == [
+        (device, 0) for device in range(count)
+    ]
+    assert lib.CAN_ScanDevice.calls == [()]
+    if legacy:
+        assert lib.CAN_GetDevType.calls == [(device,) for device in range(count)]
+    else:
+        assert lib.CAN_GetCHType.calls == [(device, 0) for device in range(count)]
+        assert lib.LibCANbus_Init.calls == [()]
+        assert lib.LibCANbus_Exit.calls == [()]
+    assert backend._lifecycle_snapshot() == {}
+    assert_no_channel_io(lib)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_linux_explicit_empty_layout_does_not_enable_defaults(library_factory, legacy):
+    lib = library_factory(legacy=legacy)
+
+    result = enumerate_minicanfd_channels(linux_channels={})
 
     assert result.channels == ()
     assert [(failure.stage, failure.device_index) for failure in result.failures] == [
         ("layout", 0),
         ("layout", 1),
     ]
-    assert all("linux_channels" in str(item.error) for item in result.failures)
-    assert lib.CAN_GetCHType.calls == []
+    if legacy:
+        assert lib.CAN_GetDevType.calls == []
+    else:
+        assert lib.CAN_GetCHType.calls == []
     assert_no_channel_io(lib)
 
 
@@ -331,14 +359,98 @@ def test_legacy_linux_device_type_does_not_validate_other_channels(library_facto
     assert lib.CAN_OpenDevice.calls == []
 
 
-def test_legacy_linux_still_requires_confirmed_layout(library_factory):
-    lib = library_factory(legacy=True)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_linux_explicit_channels_keep_type_checks_and_failure_isolation(
+    library_factory, legacy
+):
+    lib = library_factory(legacy=legacy)
+    lib.CAN_ScanDevice.result = 5
+    original = OSError("USB device disconnected")
+
+    def get_type(device, *channels):
+        if device == 3:
+            raise original
+        return (1, 0, 2, None, 1)[device]
+
+    get_type_function = lib.CAN_GetDevType if legacy else lib.CAN_GetCHType
+    get_type_function.hook = get_type
+
+    result = enumerate_minicanfd_channels(
+        linux_channels={device: (0,) for device in range(5)}
+    )
+
+    assert [(c.device_index, c.channel_index) for c in result.channels] == [
+        (0, 0),
+        (4, 0),
+    ]
+    assert len(result.failures) == 1
+    failure = result.failures[0]
+    assert (failure.stage, failure.device_index, failure.channel_index) == (
+        "type",
+        3,
+        0,
+    )
+    assert failure.error.cause is original
+    assert len(get_type_function.calls) == 5
+    assert_no_channel_io(lib)
+
+
+@pytest.mark.parametrize("channel_zero_type", [0, 2, -1])
+def test_linux_default_type_fallback_finds_fd_channel_one(
+    library_factory, channel_zero_type
+):
+    lib = library_factory()
+    lib.CAN_ScanDevice.result = 1
+    lib.CAN_GetCHType.hook = lambda device, channel: (
+        channel_zero_type if channel == 0 else 1
+    )
+
+    result = enumerate_minicanfd_channels()
+
+    assert [(c.device_index, c.channel_index) for c in result.channels] == [(0, 1)]
+    assert lib.CAN_GetCHType.calls == [(0, 0), (0, 1)]
+    assert lib.CAN_ScanDevice.calls == [()]
+    assert lib.LibCANbus_Exit.calls == [()]
+    assert_no_channel_io(lib)
+    if channel_zero_type == -1:
+        assert len(result.failures) == 1
+        assert result.failures[0].channel_index == 0
+    else:
+        assert not result.failures
+
+
+@pytest.mark.parametrize("channel_type", [0, 2, -1])
+def test_linux_default_both_unavailable_channels_return_diagnostics(
+    library_factory, channel_type
+):
+    lib = library_factory()
+    lib.CAN_ScanDevice.result = 1
+    lib.CAN_GetCHType.result = channel_type
 
     result = enumerate_minicanfd_channels()
 
     assert not result.channels
-    assert [failure.stage for failure in result.failures] == ["layout", "layout"]
-    assert lib.CAN_GetDevType.calls == []
+    assert result.failures
+    assert result.failures[-1].stage == "type"
+    assert result.failures[-1].device_index == 0
+    assert result.failures[-1].channel_index == 1
+    assert lib.CAN_GetCHType.calls == [(0, 0), (0, 1)]
+    assert_no_channel_io(lib)
+
+
+def test_legacy_default_non_fd_channel_does_not_query_unverifiable_channel_one(
+    library_factory,
+):
+    lib = library_factory(legacy=True)
+    lib.CAN_ScanDevice.result = 1
+    lib.CAN_GetDevType.result = 0
+
+    result = enumerate_minicanfd_channels()
+
+    assert not result.channels
+    assert result.failures[0].stage == "layout"
+    assert result.failures[0].channel_index == 1
+    assert lib.CAN_GetDevType.calls == [(0,)]
     assert_no_channel_io(lib)
 
 
