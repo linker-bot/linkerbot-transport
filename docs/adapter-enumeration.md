@@ -1,5 +1,8 @@
 # PCAN / SLCAN 适配器枚举
 
+本指南对应当前 `main` 源码。
+安装方式见 [README](../README_zh.md#安装当前源码)。
+
 枚举只读取驱动或操作系统信息，不打开 CAN 通道或串口，不发送 CAN/SLCAN 指令，
 不更改速率。
 
@@ -27,14 +30,15 @@ PCAN 使用 python-can 提供的 PCANBasic 包装读取 `PCAN_ATTACHED_CHANNELS`
 尝试打开 `PCAN_USBBUS1..N`。为保留错误诊断，不使用会将缺库和驱动查询失败折叠为
 空列表的通用检测封装。仅返回可用通道；占用、未知句柄及查询失败分别保留诊断。
 此状态只是查询时的快照，实际连接仍须处理竞争占用、拔出或初始化失败。
-需要安装 `linkerbot-transport[can]`、对应平台的 PCAN 驱动及 PCANBasic 动态库。
+需要在源码目录安装 `python -m pip install -e ".[can]"`，并安装对应平台的 PCAN
+驱动及 PCANBasic 动态库。
 
 SLCAN 使用 pyserial 的串口枚举。自动模式仅选择 `16D0:117E`；其他 VID/PID 需明确
 传入 `ports`，这些端口必须出现在系统枚举结果中。返回 `supports_fd=None`：USB 标识
 不是固件能力证明，FD 通信仍需支持 CANable 2.0 `d/D/b/B` 扩展的固件。经典 CAN 固件
 使用 `CANTransport`；FD 固件使用 `PythonCANFDTransport`，由应用或 hand 的探测策略
 选择。枚举不检查串口是否被占用，因为占用检查可能需要打开端口。
-安装 `linkerbot-transport[canfd]` 可获得 pyserial 依赖。
+在源码目录安装 `python -m pip install -e ".[canfd]"` 可获得 pyserial 依赖。
 
 `PythonCANEnumerationFailure` 保留 `interface`、`stage`、可选 `channel` 和
 `TransportError`；底层异常保存在 `error.cause`。阶段包括 `dependency`、`driver`、

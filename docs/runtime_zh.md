@@ -1,13 +1,18 @@
 # 传输运行时
 
+本指南对应当前 `main` 源码；安装方式见
+[README](../README_zh.md#安装当前源码)。
+
+## 生命周期
+
 经典 CAN 与 CAN FD 使用相同的显式生命周期：
 
 ```python
 from linkerbot_transport.can import CANTransport
 
 transport = CANTransport("can0")
-transport.open()
 try:
+    transport.open()
     health = transport.get_health()
 finally:
     transport.close()
@@ -18,7 +23,9 @@ finally:
 恢复后需要重新注册路由。
 
 多个 SDK 设备共用物理通道时使用 `SharedTransportPool`。第一个租约打开 Transport，
-最后一个租约关闭；清理尚未完成的对象会留在池中，后续相同 key 的 `acquire()` 会先恢复它。
+最后一个租约关闭；清理失败时对象仍保留在池中。已释放的租约可再次 `close()` 重试空闲
+清理，不重新打开通道或重复扣减引用，其 `transport` 属性仍不可用。
+后续相同 key 的 `acquire()` 可以恢复该对象；旧租约重试不会关闭已恢复的活跃连接或替换项。
 
 ## 精确接收路由
 
@@ -31,19 +38,18 @@ import can
 from linkerbot_transport.can import CANRouteKey, CANTransport
 
 transport = CANTransport("can0")
-transport.open()
-route = transport.subscribe_route(
-    CANRouteKey(arbitration_id=0x28, is_extended_id=False),
-    queue_capacity=64,
-)
 try:
-    receipt = transport.send(
-        can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
-    )
-    receipt.result(timeout=0.1)
-    message = route.receive(timeout_s=0.02)
+    transport.open()
+    with transport.subscribe_route(
+        CANRouteKey(arbitration_id=0x28, is_extended_id=False),
+        queue_capacity=64,
+    ) as route:
+        receipt = transport.send(
+            can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
+        )
+        receipt.result(timeout=0.1)
+        message = route.receive(timeout_s=0.02)
 finally:
-    route.close()
     transport.close()
 ```
 
@@ -102,8 +108,8 @@ from linkerbot_transport import TransmitArbiter
 
 generation = transport.get_health().generation
 arbiter = TransmitArbiter(transport.send, fifo_capacity=32)
-arbiter.open(generation=generation)
 try:
+    arbiter.open(generation=generation)
     receipt = arbiter.submit_latest(
         frame,
         endpoint_id="left-hand",
@@ -125,14 +131,18 @@ dispatched、superseded、failed 和容量拒绝计数。
 from linkerbot_transport import TransmitArbiter, TransmitMode
 
 arbiter = TransmitArbiter(transport.send, mode=TransmitMode.CALLER)
-arbiter.open(generation=generation)
-receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
-arbiter.drain()
-receipt.result(timeout=0.1)
+try:
+    arbiter.open(generation=generation)
+    receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
+    arbiter.drain()
+    receipt.result(timeout=0.1)
+finally:
+    arbiter.close()
 ```
 
 需要整组准入时先编码全部帧，再调用 `submit_fifo_batch()`。容量按帧计算，准入全有或全无，
-组内不会插入其他任务。`max_pending_age_s` 限制排队年龄，`deadline_at_s` 在发送第一帧前检查；
+组内不会插入其他任务。`max_pending_age_s` 在最老的排队或在途任务达到年龄上限时拒绝新
+批次；`deadline_at_s` 仅在发送第一帧前检查，不中断已开始的批次。
 物理 I/O 中止时通过 `BatchSendReceipt.sent_frames` 查看已发送前缀。准入原子不等于物理执行
 或设备确认原子。
 

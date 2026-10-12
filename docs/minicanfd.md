@@ -1,5 +1,8 @@
 # MiniCANFD 动态库：Windows 与 Linux
 
+本指南对应当前 `main` 源码。
+安装方式见 [README](../README_zh.md#安装当前源码)。
+
 Windows 使用 `HCanbus.dll`，Linux 使用 `libcanbus.so`。厂商二进制和原始协议材料
 不随 Python 包分发。
 
@@ -14,8 +17,8 @@ transport = CANFDTransport(
     library_path=r"C:\MiniCANFD\HCanbus.dll",
     config=CANFDConfigOptions(nom_baud=1_000_000, dat_baud=5_000_000),
 )
-transport.open()
 try:
+    transport.open()
     health = transport.get_health()
 finally:
     transport.close()
@@ -72,11 +75,10 @@ result = enumerate_minicanfd_channels(
 )
 ```
 
-上述 transport 枚举只查询适配器和通道类型，不判断是否接有手。`linkerbot-hand`
-的默认身份发现先探测通道 0，无身份候选且探测连接已成功关闭时，才显式请求枚举
-同一适配器的通道 1。若通道 0 在类型检查阶段已被排除，底层默认枚举直接检查通道 1；只有通过 FD 类型检查的通道才会继续身份探测。两路都无候选
-由 hand SDK 在报告中返回 `no_hand_found`。旧版设备级库仍只支持通道 0，不因上层
-回退而放宽限制；枚举失败、占用和清理异常均保留诊断。
+身份探测由上层 SDK 执行。`linkerbot-hand` 先探测通道 0；无身份候选且探测连接
+已成功关闭后，再请求同一适配器的通道 1。通道 0 已被类型检查排除时，底层枚举直接
+检查通道 1；只有 FD 通道进入身份探测，两路均无候选时由 hand 报告
+`no_hand_found`。旧版设备级库仅支持通道 0，枚举、占用和清理失败仍保留诊断。
 
 需要覆盖默认选择时，按厂商规格或已确认的接线显式提供 `linux_channels`，例如
 `{0: (0, 1), 1: (0,)}` 表示设备 0 的通道 0/1、设备 1 的通道 0。显式映射保持严格
@@ -143,7 +145,7 @@ Windows 的 `device_index` 对应 DLL 枚举的**通道编号**，`channel_index
 若通道已关闭但 `LibCANbus_Exit` 失败，`close()` 仍报错并保留清理重试；再次关闭只重试
 尚未完成的库清理，不重复关闭通道或扣减引用，也不会影响随后已打开的新连接。
 
-本地回归覆盖两套函数参数、结构体二进制布局、单帧/批量收发、DLL 路径和依赖目录、
+回归测试覆盖两套函数参数、结构体二进制布局、单帧/批量收发、DLL 路径和依赖目录、
 初始化失败与清理重试。CI 提供 Windows/Linux、Python 3.10/3.13 的无硬件测试。
 Windows 真机还需验证：驱动加载与枚举、FD/BRS 和 DLC、双向长时间负载、插拔与恢复、
 多次打开关闭。当前未宣称 Windows 实机通过，静态 DLL 检查和测试桩不替代实机验证。

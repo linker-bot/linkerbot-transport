@@ -1,14 +1,18 @@
 # Transport runtime
 
-This guide describes the public runtime contracts shared by classic CAN and CAN
-FD transports. All transports use an explicit lifecycle:
+This guide describes the current `main` source. See
+[source installation](../README.md#install-the-current-source) for setup.
+
+## Lifecycle
+
+Classic CAN and CAN FD transports share an explicit lifecycle:
 
 ```python
 from linkerbot_transport.can import CANTransport
 
 transport = CANTransport("can0")
-transport.open()
 try:
+    transport.open()
     health = transport.get_health()
 finally:
     transport.close()
@@ -42,19 +46,18 @@ import can
 from linkerbot_transport.can import CANRouteKey, CANTransport
 
 transport = CANTransport("can0")
-transport.open()
-route = transport.subscribe_route(
-    CANRouteKey(arbitration_id=0x28, is_extended_id=False),
-    queue_capacity=64,
-)
 try:
-    receipt = transport.send(
-        can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
-    )
-    receipt.result(timeout=0.1)
-    message = route.receive(timeout_s=0.02)
+    transport.open()
+    with transport.subscribe_route(
+        CANRouteKey(arbitration_id=0x28, is_extended_id=False),
+        queue_capacity=64,
+    ) as route:
+        receipt = transport.send(
+            can.Message(arbitration_id=0x28, data=[0xC2], is_extended_id=False)
+        )
+        receipt.result(timeout=0.1)
+        message = route.receive(timeout_s=0.02)
 finally:
-    route.close()
     transport.close()
 ```
 
@@ -132,8 +135,8 @@ from linkerbot_transport import TransmitArbiter
 
 generation = transport.get_health().generation
 arbiter = TransmitArbiter(transport.send, fifo_capacity=32)
-arbiter.open(generation=generation)
 try:
+    arbiter.open(generation=generation)
     receipt = arbiter.submit_latest(
         frame,
         endpoint_id="left-hand",
@@ -157,16 +160,21 @@ For an actor that already owns the I/O loop, use `TransmitMode.CALLER` and call
 from linkerbot_transport import TransmitArbiter, TransmitMode
 
 arbiter = TransmitArbiter(transport.send, mode=TransmitMode.CALLER)
-arbiter.open(generation=generation)
-receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
-arbiter.drain()
-receipt.result(timeout=0.1)
+try:
+    arbiter.open(generation=generation)
+    receipt = arbiter.submit_fifo(frame, endpoint_id="left-hand")
+    arbiter.drain()
+    receipt.result(timeout=0.1)
+finally:
+    arbiter.close()
 ```
 
 Prepare all frames before `submit_fifo_batch()` when they must be admitted as one
 group. Capacity is measured in frames; admission is all-or-none and frames in a
-batch are not interleaved with another job. `max_pending_age_s` rejects work
-that is already too old, while `deadline_at_s` is checked before dispatch.
+batch are not interleaved with another job. `max_pending_age_s` rejects a new
+batch when the oldest queued or in-flight work has reached the age limit.
+`deadline_at_s` is checked before the first frame; it does not truncate a
+batch that has already started.
 `BatchSendReceipt.sent_frames` reports the successful prefix if physical I/O
 stops the unsent suffix. Admission is atomic; physical execution and device
 acknowledgement are not.

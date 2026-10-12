@@ -7,13 +7,13 @@ send results, shared connection leases, and bounded transmit scheduling.
 [简体中文](README_zh.md)
 
 The package is independent of ROS, hand models, arm models, and kinematics.
+This README and the [guides](docs/README.md) describe the current `main` source.
 
 ## Install the current source
 
-The current hand and transport versions are not published to the package index.
-Install both repositories in editable mode so changes in either checkout are
-used immediately. The commands below assume both repositories are under
-`~/src` and create an environment named `py-linkerbot`:
+Use Python 3.10 or newer. The examples assume the checkout is under `~/src`
+and use an environment named `py-linkerbot`. Editable installation uses the
+checkout's code.
 
 ### uv
 
@@ -21,13 +21,8 @@ used immediately. The commands below assume both repositories are under
 cd ~/src
 uv venv py-linkerbot --python 3.12
 source py-linkerbot/bin/activate
-
 uv pip install -e "./linkerbot-transport[all]"
-uv pip install -e ./linkerbot-hand
 ```
-
-On Windows PowerShell, activate with
-`./py-linkerbot/Scripts/Activate.ps1` before running the two install commands.
 
 ### pip
 
@@ -36,40 +31,18 @@ cd ~/src
 python3.12 -m venv py-linkerbot
 source py-linkerbot/bin/activate
 python -m pip install --upgrade pip setuptools wheel
-
 python -m pip install -e "./linkerbot-transport[all]"
-python -m pip install -e ./linkerbot-hand
 ```
 
-Verify that imports resolve to the checkouts:
+On Windows PowerShell, activate with `./py-linkerbot/Scripts/Activate.ps1`.
+Replace `[all]` with `[can]` for classic python-can backends or `[canfd]` for
+python-can CAN FD and serial support; omit extras for the base package.
+Vendor drivers and libraries are installed separately; see the backend guides below.
+
+Verify that imports resolve to the checkout:
 
 ```bash
-python -c "import linkerbot_hand, linkerbot_transport; print(linkerbot_hand.__file__); print(linkerbot_transport.__file__)"
-```
-
-### Install a released package
-
-Install the backend used by the application:
-
-```bash
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  --extra-index-url https://pypi.org/simple \
-  "linkerbot-transport[can]==1.0.0"
-```
-
-Use `canfd` for python-can SLCAN/FD support, or install the base package when
-only the shared errors and concurrency primitives are needed:
-
-```bash
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  --extra-index-url https://pypi.org/simple \
-  "linkerbot-transport[canfd]==1.0.0"
-
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  "linkerbot-transport==1.0.0"
+python -c "import linkerbot_transport; print(linkerbot_transport.__file__)"
 ```
 
 ## Select a backend
@@ -94,8 +67,8 @@ transport; always close it in `finally`:
 from linkerbot_transport.can import CANTransport
 
 transport = CANTransport("can0")
-transport.open()
 try:
+    transport.open()
     health = transport.get_health()
     print(health.state, health.generation)
 finally:

@@ -6,12 +6,12 @@ CAN FD、精确接收路由、可观测发送回执、共享连接租约和有�
 [English](README.md)
 
 本包不依赖 ROS、灵巧手型号、机械臂型号或运动学库。
+本 README 和[使用指南](docs/README.md)对应当前 `main` 源码。
 
 ## 安装当前源码
 
-当前 hand 和 transport 版本尚未发布到包仓库。需要同时对两个源码仓库使用 editable
-安装，这样修改会立即生效。以下命令假设两个仓库位于 `~/src`，并创建名为
-`py-linkerbot` 的虚拟环境：
+使用 Python 3.10 或更新版本。以下示例假设源码仓库位于 `~/src`，使用名为
+`py-linkerbot` 的虚拟环境；editable 安装会直接使用源码目录的代码。
 
 ### uv
 
@@ -19,13 +19,8 @@ CAN FD、精确接收路由、可观测发送回执、共享连接租约和有�
 cd ~/src
 uv venv py-linkerbot --python 3.12
 source py-linkerbot/bin/activate
-
 uv pip install -e "./linkerbot-transport[all]"
-uv pip install -e ./linkerbot-hand
 ```
-
-Windows PowerShell 激活环境使用 `./py-linkerbot/Scripts/Activate.ps1`，然后执行上面的
-两个安装命令。
 
 ### pip
 
@@ -34,39 +29,17 @@ cd ~/src
 python3.12 -m venv py-linkerbot
 source py-linkerbot/bin/activate
 python -m pip install --upgrade pip setuptools wheel
-
 python -m pip install -e "./linkerbot-transport[all]"
-python -m pip install -e ./linkerbot-hand
 ```
+
+Windows PowerShell 使用 `./py-linkerbot/Scripts/Activate.ps1` 激活环境。
+经典 python-can 后端可将 `[all]` 改为 `[can]`，python-can CAN FD 与串口支持可改为
+`[canfd]`，基础包省略 extras。厂商驱动和动态库另行安装，见下方后端指南。
 
 确认导入路径来自源码目录：
 
 ```bash
-python -c "import linkerbot_hand, linkerbot_transport; print(linkerbot_hand.__file__); print(linkerbot_transport.__file__)"
-```
-
-### 安装已发布版本
-
-按应用使用的后端安装：
-
-```bash
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  --extra-index-url https://pypi.org/simple \
-  "linkerbot-transport[can]==1.0.0"
-```
-
-python-can SLCAN/CAN FD 使用 `canfd`；只使用公共异常和并发原语时安装基础包：
-
-```bash
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  --extra-index-url https://pypi.org/simple \
-  "linkerbot-transport[canfd]==1.0.0"
-
-python -m pip install \
-  --index-url https://gitea.linkerhub.work/api/packages/zhuzhixiang/pypi/simple \
-  "linkerbot-transport==1.0.0"
+python -c "import linkerbot_transport; print(linkerbot_transport.__file__)"
 ```
 
 ## 后端选择
@@ -89,8 +62,8 @@ python -m pip install \
 from linkerbot_transport.can import CANTransport
 
 transport = CANTransport("can0")
-transport.open()
 try:
+    transport.open()
     health = transport.get_health()
     print(health.state, health.generation)
 finally:
