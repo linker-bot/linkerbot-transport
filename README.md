@@ -15,6 +15,14 @@ Use Python 3.10 or newer. The examples assume the checkout is under `~/src`
 and use an environment named `py-linkerbot`. Editable installation uses the
 checkout's code.
 
+First clone the repository; skip this step if you already have a local checkout:
+
+```bash
+mkdir -p ~/src
+cd ~/src
+git clone https://gitea.linkerhub.work/linker-bot/linkerbot-transport.git
+```
+
 ### uv
 
 ```bash

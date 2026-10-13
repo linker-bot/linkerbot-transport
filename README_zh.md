@@ -13,6 +13,14 @@ CAN FD、精确接收路由、可观测发送回执、共享连接租约和有�
 使用 Python 3.10 或更新版本。以下示例假设源码仓库位于 `~/src`，使用名为
 `py-linkerbot` 的虚拟环境；editable 安装会直接使用源码目录的代码。
 
+先获取源码；如果已有本地仓库，可以跳过此步骤：
+
+```bash
+mkdir -p ~/src
+cd ~/src
+git clone https://gitea.linkerhub.work/linker-bot/linkerbot-transport.git
+```
+
 ### uv
 
 ```bash
