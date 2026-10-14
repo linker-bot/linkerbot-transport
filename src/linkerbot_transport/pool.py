@@ -80,7 +80,8 @@ class SharedTransportPool(Generic[TransportT]):
     cannot overlap the previous connection's shutdown. Failed opens are closed
     before their entries are removed. If cleanup also fails, the pool retains
     the transport without issuing a lease; a later acquire recovers that same
-    object before any caller can use the channel again.
+    object before any caller can use the channel again. Call ``close_idle(key)``
+    to retry retained cleanup without acquiring or reopening a connection.
     """
 
     def __init__(self) -> None:
@@ -129,6 +130,21 @@ class SharedTransportPool(Generic[TransportT]):
             entry.leases += 1
             return TransportLease(self, key, entry.transport)
 
+    def close_idle(self, key: Hashable) -> None:
+        """Retry closing a retained zero-lease connection without reopening it.
+
+        Missing entries and entries with active leases are left untouched.
+        Close is serialized with acquire; a failure propagates and leaves the
+        entry in the pool for another close or recovery attempt.
+        """
+
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.leases > 0:
+                return
+            entry.transport.close()
+            del self._entries[key]
+
     def lease_count(self, key: Hashable) -> int:
         """Return the active reference count for ``key``."""
 
@@ -168,8 +184,7 @@ class SharedTransportPool(Generic[TransportT]):
             entry = self._entries.get(key)
             if entry is None or entry.transport is not transport or entry.leases > 0:
                 return
-            entry.transport.close()
-            del self._entries[key]
+            self.close_idle(key)
 
 
 __all__ = ["SharedTransportPool", "TransportLease"]

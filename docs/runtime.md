@@ -33,6 +33,12 @@ reference was released. A later matching `acquire()` can still recover the
 retained object; an old lease retry never closes a recovered active owner or a
 replacement entry.
 
+If `acquire()` raises before returning a lease, call `pool.close_idle(key)` to
+retry cleanup for that key. It closes only a retained connection with zero active
+leases, under the same lock as `acquire()`, without reopening the channel. Missing
+keys and connections with active leases are left untouched. Close errors propagate
+and leave the entry available for another cleanup or recovery attempt.
+
 ## Exact receive routes
 
 Routes are exclusive, bounded subscriptions. A received frame is assigned one

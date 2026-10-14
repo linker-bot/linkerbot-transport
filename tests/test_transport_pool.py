@@ -175,6 +175,7 @@ def test_old_close_retry_does_not_close_a_recovered_active_owner():
     with pytest.raises(TransportError):
         old.close()
     current = pool.acquire("shared", lambda: pytest.fail("must recover same object"))
+    pool.close_idle("shared")
     old.close()
     old.close()
     assert pool.lease_count("shared") == 1
@@ -232,7 +233,8 @@ def test_close_callback_can_reenter_the_same_lease_without_deadlock():
     assert pool.active_keys() == ()
 
 
-def test_acquire_waits_for_an_in_progress_cleanup_retry():
+@pytest.mark.parametrize("via_pool", [False, True])
+def test_acquire_waits_for_an_in_progress_cleanup_retry(via_pool):
     pool = SharedTransportPool[FakeTransport[int]]()
     old = pool.acquire("serialized-retry", FakeTransport[int])
     transport = old.transport
@@ -256,7 +258,10 @@ def test_acquire_waits_for_an_in_progress_cleanup_retry():
 
     def retry():
         try:
-            old.close()
+            if via_pool:
+                pool.close_idle("serialized-retry")
+            else:
+                old.close()
         except BaseException as error:
             errors.append(error)
 
@@ -430,3 +435,67 @@ def test_failed_factory_does_not_leave_a_pool_entry() -> None:
         pool.acquire("can0", create)
     assert pool.active_keys() == ()
     assert pool.lease_count("can0") == 0
+
+
+@pytest.mark.parametrize("cleanup_error", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("failed_recovery", [False, True])
+def test_close_idle_retries_failed_open_without_reopening(
+    cleanup_error, failed_recovery
+):
+    pool = SharedTransportPool[ManagedMessageTransport[int]]()
+    dispatchers = []
+
+    def create_dispatcher(on_bus_error):
+        dispatcher = OpeningDispatcher(
+            on_bus_error,
+            subscribe_error=OSError("subscribe failed"),
+            cleanup_error=OSError("cleanup failed"),
+        )
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    transport = ManagedMessageTransport(create_dispatcher, lambda message: message)
+    with pytest.raises(TransportError, match="subscribe failed"):
+        pool.acquire("idle", lambda: transport)
+    if failed_recovery:
+        with pytest.raises(TransportError, match="cleanup failed"):
+            pool.acquire("idle", lambda: pytest.fail("must reuse retained object"))
+
+    failure = cleanup_error("cleanup retry failed")
+    dispatchers[0].cleanup_error = failure
+    with pytest.raises(cleanup_error) as captured:
+        pool.close_idle("idle")
+    assert captured.value is failure or captured.value.__cause__ is failure
+    assert pool.active_keys() == ("idle",)
+    assert pool.lease_count("idle") == 0
+    assert dispatchers[0].live
+
+    dispatchers[0].cleanup_error = None
+    generation = transport.get_health().generation
+    pool.close_idle("idle")
+    assert pool.active_keys() == ()
+    assert not dispatchers[0].live
+    assert len(dispatchers) == 1
+    assert transport.get_health().state is TransportState.CLOSED
+    assert transport.get_health().generation == generation
+    close_count = dispatchers[0].stop_count
+    pool.close_idle("idle")
+    assert dispatchers[0].stop_count == close_count
+
+
+def test_close_idle_leaves_missing_and_active_entries_untouched():
+    pool = SharedTransportPool[FakeTransport[int]]()
+    pool.close_idle("missing")
+    first = pool.acquire("active", FakeTransport[int])
+    transport = first.transport
+    second = pool.acquire("active", lambda: pytest.fail("must share connection"))
+    pool.close_idle("active")
+    assert pool.lease_count("active") == 2
+    assert transport.current_dispatcher.stop_count == 0
+    first.close()
+    pool.close_idle("active")
+    assert pool.lease_count("active") == 1
+    assert transport.get_health().state is TransportState.OPEN
+    assert transport.current_dispatcher.stop_count == 0
+    second.close()
+    assert pool.active_keys() == ()
