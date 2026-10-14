@@ -140,6 +140,14 @@ class ManagedMessageTransport(Generic[MessageT]):
                         if self._opening_error is not None:
                             raise self._opening_error
                         raise DeviceNotReadyError("dispatcher failed while opening")
+                    # Commit under the same lock as the fault check. A worker
+                    # fault after this point must remain FAULTED, not be
+                    # overwritten by the successful open transition.
+                    self._dispatcher = dispatcher
+                    self._receive_callback = on_message
+                    self._consecutive_errors = 0
+                    self._opening_error = None
+                    self._state = TransportState.OPEN
             except BaseException as error:
                 # A CAN constructor can fail after opening its bus. If its own
                 # rollback also failed, take ownership for an explicit retry.
@@ -166,13 +174,6 @@ class ManagedMessageTransport(Generic[MessageT]):
                 if not isinstance(error, Exception):
                     raise
                 _raise_classified(classified, error)
-
-            with self._state_lock:
-                self._dispatcher = dispatcher
-                self._receive_callback = on_message
-                self._consecutive_errors = 0
-                self._opening_error = None
-                self._state = TransportState.OPEN
 
     def close(self) -> None:
         """Stop the owned dispatcher, retaining it when shutdown must retry."""

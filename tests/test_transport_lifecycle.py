@@ -13,7 +13,12 @@ from linkerbot_transport.canfd import (
     SocketCANFDTransport,
 )
 from linkerbot_transport.contracts import MessageTransport, TransportState
-from linkerbot_transport.errors import ClosedError, ErrorCode, TransportError
+from linkerbot_transport.errors import (
+    ClosedError,
+    DeviceNotReadyError,
+    ErrorCode,
+    TransportError,
+)
 from linkerbot_transport.receipts import SendOutcome, SendReceipt
 from linkerbot_transport.routing import CANRouteKey
 from linkerbot_transport.testing import FakeDispatcher, FakeTransport
@@ -481,6 +486,73 @@ def test_late_error_from_closed_generation_is_ignored() -> None:
     health = transport.get_health()
     assert health.state is TransportState.CLOSED
     assert health.consecutive_errors == 0
+
+
+@pytest.mark.parametrize("kind", ["can", "canfd"])
+def test_fault_after_open_commit_cannot_be_overwritten(kind) -> None:
+    dispatchers = []
+
+    def create(on_error):
+        dispatcher = FakeDispatcher(on_error)
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    transport = (
+        CANTransport("can0", dispatcher_factory=create)
+        if kind == "can"
+        else CANFDTransport(dispatcher_factory=create)
+    )
+    fault_now, fault_done = threading.Event(), threading.Event()
+
+    def fault_worker():
+        if fault_now.wait(2):
+            dispatchers[0].disconnect(OSError("fault at open commit"))
+            fault_done.set()
+
+    worker = threading.Thread(target=fault_worker)
+    owner = threading.get_ident()
+    original_lock = transport._state_lock
+
+    class InterleaveLock:
+        owner_exits = 0
+
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            original_lock.release()
+            if threading.get_ident() == owner:
+                self.owner_exits += 1
+                # Force a fault immediately after open's final check releases
+                # the lock. This reproduced the former check/commit gap.
+                if self.owner_exits == 2:
+                    fault_now.set()
+                    assert fault_done.wait(2)
+
+    transport._state_lock = InterleaveLock()
+    worker.start()
+    try:
+        transport.open()
+        health = transport.get_health()
+        assert health.state is TransportState.FAULTED
+        assert not health.connected
+        assert health.consecutive_errors == 1
+        assert "fault at open commit" in health.last_error
+        with pytest.raises(DeviceNotReadyError):
+            transport.subscribe_route(CANRouteKey(61, False))
+        # The committed dispatcher remains owned, so recovery closes it.
+        transport.recover()
+        assert dispatchers[0].stop_count == 1
+        assert transport.get_health().state is TransportState.OPEN
+        assert transport.get_health().generation == 2
+        route = transport.subscribe_route(CANRouteKey(61, False))
+        route.close()
+    finally:
+        fault_now.set()
+        worker.join(2)
+        transport.close()
+        assert not worker.is_alive()
 
 
 def test_late_frame_from_old_generation_is_counted_and_not_delivered() -> None:
