@@ -20,7 +20,7 @@ First clone the repository; skip this step if you already have a local checkout:
 ```bash
 mkdir -p ~/src
 cd ~/src
-git clone https://gitea.linkerhub.work/linker-bot/linkerbot-transport.git
+git clone https://github.com/linker-bot/linkerbot-transport.git
 ```
 
 ### uv
