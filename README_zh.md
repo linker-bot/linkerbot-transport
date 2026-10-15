@@ -18,7 +18,7 @@ CAN FD、精确接收路由、可观测发送回执、共享连接租约和有�
 ```bash
 mkdir -p ~/src
 cd ~/src
-git clone https://gitea.linkerhub.work/linker-bot/linkerbot-transport.git
+git clone https://github.com/linker-bot/linkerbot-transport.git
 ```
 
 ### uv
