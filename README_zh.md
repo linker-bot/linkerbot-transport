@@ -90,3 +90,10 @@ Transport 从 `linkerbot_transport.can` 和 `linkerbot_transport.canfd` 导入�
 
 路由订阅、健康指标、发送回执、latest-wins/FIFO 仲裁、批量准入和调用方排空方式见
 [传输运行时](docs/runtime_zh.md)，完整文档列表见[文档索引](docs/README.md)。
+
+## 贡献与许可证
+
+欢迎用中文或英文参与贡献，请遵循[Linkerbot 贡献指南](https://github.com/linker-bot/.github/blob/main/CONTRIBUTING.md)。
+安全问题请按[组织安全策略](https://github.com/linker-bot/.github/blob/main/SECURITY.md)私下报告。
+
+本项目采用 [MIT 许可证](LICENSE)。
