@@ -99,3 +99,12 @@ connection generation.
 Read [Transport runtime](docs/runtime.md) for route subscriptions, health
 metrics, receipts, latest-wins/FIFO arbitration, batch admission, and caller
 draining. The [documentation index](docs/README.md) lists all guides.
+
+## Contributing and license
+
+English and Chinese contributions are welcome. Follow the
+[Linkerbot contribution guide](https://github.com/linker-bot/.github/blob/main/CONTRIBUTING.md).
+Report vulnerabilities privately using the
+[organization security policy](https://github.com/linker-bot/.github/blob/main/SECURITY.md).
+
+Licensed under the [MIT License](LICENSE).
