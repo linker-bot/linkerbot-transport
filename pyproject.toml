@@ -61,6 +61,7 @@ addopts = ["-ra", "--strict-markers"]
 markers = ["canfd: Tests for CAN FD communication"]
 
 [tool.ruff]
+extend-exclude = ["*.md"]
 target-version = "py310"
 line-length = 88
 
