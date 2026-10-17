@@ -41,8 +41,8 @@ defaults:
     shell: bash
 
 env:
-  CI_DEPENDENCY_OWNER: ${{ inputs.dependency_owner || vars.CI_DEPENDENCY_OWNER || 'linker-bot' }}
-  CI_DEPENDENCY_REF: ${{ inputs.dependency_ref || vars.CI_DEPENDENCY_REF || 'main' }}
+  CI_DEPENDENCY_OWNER: ${{ inputs.dependency_owner || 'linker-bot' }}
+  CI_DEPENDENCY_REF: ${{ inputs.dependency_ref || 'main' }}
   PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
   PYTHONDONTWRITEBYTECODE: "1"
 
