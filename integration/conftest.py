@@ -9,11 +9,14 @@ import pytest
 from .devices import FourDevices
 
 
+@pytest.fixture(params=["cantransport", "dispatcher"])
+def arm_backend(request, monkeypatch):
+    # Exercise both supported Arm adapters against the same Transport package.
+    monkeypatch.setenv("LINKERBOT_ARM_TRANSPORT", request.param)
+
+
 @pytest.fixture
-def four_devices(request, monkeypatch):
-    # Select the production shared Transport path explicitly, regardless of a
-    # developer's shell setting for the legacy Arm backend.
-    monkeypatch.setenv("LINKERBOT_ARM_TRANSPORT", "cantransport")
+def four_devices(request, arm_backend):
     prefix = "joint-" + uuid.uuid4().hex
     channels = tuple(f"{prefix}-{index}" for index in range(4))
     rig = FourDevices(
