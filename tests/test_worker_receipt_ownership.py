@@ -1,5 +1,6 @@
 """Controlled worker startup, false join status and receipt handoff windows."""
 
+import os
 import queue
 import threading
 
@@ -281,8 +282,10 @@ def test_interruption_before_slot_update_never_dispatches_superseded_job(
         arbiter.close()
 
 
+@pytest.mark.skipif(
+    os.name != "posix", reason="requires catchable POSIX os.kill(SIGINT) semantics"
+)
 def test_sigint_during_close_does_not_discard_a_running_worker():
-    import os
     import signal
 
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
