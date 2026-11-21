@@ -83,7 +83,7 @@ def test_queued_classic_send_classifies_types_without_guessing_text(
 @pytest.mark.parametrize("filename", ["runtime.md", "runtime_zh.md"])
 @pytest.mark.parametrize("terminal", [False, True])
 def test_documented_receipt_example_catches_the_correct_timeout(filename, terminal):
-    text = (Path(__file__).parents[1] / "docs" / filename).read_text()
+    text = (Path(__file__).parents[1] / "docs" / filename).read_text(encoding="utf-8")
     section = text.split("`SendReceipt`", 1)[1]
     snippet = section.split("```python\n", 1)[1].split("```", 1)[0]
     tree = ast.parse(snippet)
