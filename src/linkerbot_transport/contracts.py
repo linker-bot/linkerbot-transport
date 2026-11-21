@@ -13,6 +13,9 @@ from .routing import RouteSubscription
 
 MessageT = TypeVar("MessageT")
 
+# Bound each synchronous batch so shutdown can reject the next block.
+_MAX_SEND_BATCH_FRAMES = 32
+
 
 class TransportState(str, Enum):
     """Lifecycle state of one physical transport connection."""

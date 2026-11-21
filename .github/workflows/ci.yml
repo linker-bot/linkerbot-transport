@@ -26,6 +26,10 @@ on:
         description: Include all supported Python versions
         type: boolean
         default: false
+      arm_ros_ref:
+        description: linkerbot-arm-ros2-sdk branch, tag or commit (empty uses dependency_ref/main)
+        type: string
+        default: ""
   schedule:
     - cron: "17 3 * * 1"
 
@@ -194,7 +198,7 @@ jobs:
           persist-credentials: false
           repository: ${{ env.CI_DEPENDENCY_OWNER }}/linkerbot-arm-ros2-sdk
           path: .ci/arm-ros2
-          ref: ${{ env.CI_DEPENDENCY_REF }}
+          ref: ${{ inputs.arm_ros_ref || env.CI_DEPENDENCY_REF }}
       - name: Pin and record source revisions for all consumer jobs
         id: revisions
         run: |

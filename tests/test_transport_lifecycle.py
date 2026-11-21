@@ -281,7 +281,8 @@ def test_receive_route_notifier_runs_outside_transport_state_lock() -> None:
     transport.close()
 
 
-def test_route_abort_notifier_runs_outside_transport_state_lock() -> None:
+@pytest.mark.parametrize("operation", ["abort", "close", "recover"])
+def test_route_terminal_notifier_runs_outside_transport_state_lock(operation) -> None:
     transport = FakeTransport[int]()
     transport.open()
     state_lock_available = False
@@ -303,12 +304,80 @@ def test_route_abort_notifier_runs_outside_transport_state_lock() -> None:
 
     route = transport.subscribe_route(1, on_available=notify)
 
-    transport.current_dispatcher.disconnect(OSError("unplugged"))
+    if operation == "abort":
+        transport.current_dispatcher.disconnect(OSError("unplugged"))
+    else:
+        getattr(transport, operation)()
 
     assert state_lock_available
-    with pytest.raises(TransportError, match="unplugged"):
+    expected_error = TransportError if operation == "abort" else ClosedError
+    with pytest.raises(expected_error):
         route.receive(timeout_s=0)
     transport.close()
+
+
+def test_close_can_finish_while_receive_notifier_reads_health(monkeypatch) -> None:
+    transport = FakeTransport[int]()
+    transport.open()
+    dispatcher = transport.current_dispatcher
+    callback_started = threading.Event()
+    closing_route = threading.Event()
+    health_reads: list[TransportState] = []
+    state_lock_available: list[bool] = []
+    errors: list[BaseException] = []
+
+    def notify() -> None:
+        if callback_started.is_set():
+            return
+        callback_started.set()
+        if not closing_route.wait(timeout=2):
+            return
+        # Bound this probe so a regression reports failure without leaving
+        # deadlocked test threads. get_health itself only reads cached state.
+        acquired = transport._state_lock.acquire(timeout=1)
+        state_lock_available.append(acquired)
+        if acquired:
+            try:
+                health_reads.append(transport.get_health().state)
+            finally:
+                transport._state_lock.release()
+
+    route = transport.subscribe_route(1, on_available=notify)
+    original_notify_closed = route._state.notify_closed
+
+    def notify_closed() -> None:
+        closing_route.set()
+        original_notify_closed()
+
+    monkeypatch.setattr(route._state, "notify_closed", notify_closed)
+
+    def run(action) -> None:
+        try:
+            action()
+        except BaseException as error:
+            errors.append(error)
+
+    receiver = threading.Thread(target=run, args=(lambda: transport.emit(1),))
+    closer = threading.Thread(target=run, args=(transport.close,))
+    receiver.start()
+    try:
+        assert callback_started.wait(timeout=2)
+        closer.start()
+    finally:
+        if closer.ident is None:
+            closing_route.set()
+        receiver.join(timeout=3)
+        if closer.ident is not None:
+            closer.join(timeout=3)
+        transport.close()
+
+    assert not receiver.is_alive() and not closer.is_alive()
+    assert errors == []
+    assert state_lock_available == [True]
+    assert health_reads == [TransportState.CLOSING]
+    assert not route.get_health().active
+    assert dispatcher.stop_count == 1
+    assert transport.get_health().state is TransportState.CLOSED
 
 
 def test_can_and_canfd_health_count_dlc_data_bytes() -> None:
@@ -486,6 +555,85 @@ def test_late_error_from_closed_generation_is_ignored() -> None:
     health = transport.get_health()
     assert health.state is TransportState.CLOSED
     assert health.consecutive_errors == 0
+
+
+@pytest.mark.parametrize("kind", ["can", "canfd"])
+@pytest.mark.parametrize("boundary", ["abort", "_stop"])
+def test_error_checked_before_recover_cannot_abort_new_routes(
+    monkeypatch, kind, boundary
+) -> None:
+    dispatchers = []
+
+    def create(on_error):
+        dispatcher = FakeDispatcher(on_error)
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    transport = (
+        CANTransport("can0", dispatcher_factory=create)
+        if kind == "can"
+        else CANFDTransport(dispatcher_factory=create)
+    )
+    transport.open()
+    router = transport._receive_router
+    old_route = transport.subscribe_route(CANRouteKey(61, False))
+    fault_checked = threading.Event()
+    finish_fault = threading.Event()
+    errors: list[BaseException] = []
+    original = getattr(router, boundary)
+
+    def delay_old_fault(error, *, generation=None):
+        if threading.current_thread() is worker:
+            fault_checked.set()
+            if not finish_fault.wait(timeout=2):
+                raise RuntimeError("test did not release the old fault")
+        if generation is None:
+            return original(error)
+        return original(error, generation=generation)
+
+    monkeypatch.setattr(router, boundary, delay_old_fault)
+
+    def disconnect() -> None:
+        try:
+            dispatchers[0].disconnect(OSError("old connection failed"))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=disconnect)
+    worker.start()
+    try:
+        assert fault_checked.wait(timeout=2)
+        transport.recover()
+        current = transport.subscribe_route(CANRouteKey(61, False))
+        message = (
+            can.Message(arbitration_id=61, is_extended_id=False, data=b"new")
+            if kind == "can"
+            else CANFDMessage(arbitration_id=61, is_extended_id=False, data=b"new")
+        )
+        dispatchers[1].emit(message)
+        before = router.get_health()
+        finish_fault.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert errors == []
+        assert router.get_health() == before
+        assert current.get_health().active
+        assert current.receive(timeout_s=0).message is message
+        extra = transport.subscribe_route(CANRouteKey(62, False))
+        assert extra.get_health().active
+        assert not old_route.get_health().active
+        health = transport.get_health()
+        assert health.state is TransportState.OPEN
+        assert health.generation == 2
+        assert health.reconnect_count == 1
+        assert health.consecutive_errors == 0
+        assert dispatchers[0].stop_count == 1
+    finally:
+        finish_fault.set()
+        worker.join(timeout=2)
+        transport.close()
+        assert not worker.is_alive()
 
 
 @pytest.mark.parametrize("kind", ["can", "canfd"])

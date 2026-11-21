@@ -9,9 +9,11 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from itertools import islice
-from typing import Generic, TypeVar
+from itertools import chain, islice
+from typing import Generic, Protocol, TypeVar
 
+from ._worker import WorkerThread
+from .contracts import _MAX_SEND_BATCH_FRAMES
 from .errors import (
     ClosedError,
     DeviceNotReadyError,
@@ -21,9 +23,19 @@ from .errors import (
     ValidationError,
     normalize_error,
 )
-from .receipts import BatchSendReceipt, SendOutcome, SendReceipt
+from .receipts import BatchSendReceipt, SendOutcome, SendReceipt, _ReceiptTracker
 
 MessageT = TypeVar("MessageT")
+
+
+class _BatchDispatch(Protocol[MessageT]):
+    def __call__(
+        self,
+        messages: tuple[MessageT, ...],
+        *,
+        expected_generation: int,
+        on_progress: Callable[[int], None],
+    ) -> BatchSendReceipt: ...
 
 
 class SendPolicy(str, Enum):
@@ -130,12 +142,21 @@ class TransmitArbiter(Generic[MessageT]):
     already own I/O actors: submission remains non-blocking, and one actor calls
     :meth:`drain` to cooperatively empty the shared queue. Concurrent actors can
     still enqueue and replace unclaimed latest work while a drain is active.
+
+    ``dispatch_batch`` explicitly enables blocks of at most 32 frames for FIFO
+    batches. Use a managed transport's ``send_batch`` and open the arbiter with
+    that transport's generation. A custom callback accepts ``messages``,
+    ``expected_generation`` and ``on_progress`` keywords, and returns a
+    ``BatchSendReceipt``. It reports cumulative confirmed progress within that
+    block before publishing the receipt; process-interrupt retries may repeat
+    the last count. Single messages keep the ordinary ``dispatch`` path.
     """
 
     def __init__(
         self,
         dispatch: Callable[[MessageT], SendReceipt],
         *,
+        dispatch_batch: _BatchDispatch[MessageT] | None = None,
         latest_capacity: int = 64,
         fifo_capacity: int = 64,
         aging_quantum_s: float = 0.05,
@@ -145,6 +166,8 @@ class TransmitArbiter(Generic[MessageT]):
     ) -> None:
         if not callable(dispatch):
             raise ValidationError("dispatch must be callable")
+        if dispatch_batch is not None and not callable(dispatch_batch):
+            raise ValidationError("dispatch_batch must be callable")
         if (
             not isinstance(latest_capacity, int)
             or isinstance(latest_capacity, bool)
@@ -165,6 +188,7 @@ class TransmitArbiter(Generic[MessageT]):
             raise ValidationError("mode must be a TransmitMode")
 
         self._dispatch = dispatch
+        self._dispatch_batch = dispatch_batch
         self._latest_capacity = latest_capacity
         self._fifo_capacity = fifo_capacity
         self._aging_quantum_s = float(aging_quantum_s)
@@ -172,11 +196,16 @@ class TransmitArbiter(Generic[MessageT]):
         self._monotonic = monotonic
         self._mode = mode
         self._condition = threading.Condition(threading.RLock())
+        self._cleanup_receipts = _ReceiptTracker()
         self._latest: dict[tuple[Hashable, Hashable], _PendingSend[MessageT]] = {}
+        # Derived membership cache only. Invalidate before changing queue
+        # membership, then publish the updated cache after both mutations.
+        # An interrupt leaves None, so the next lookup rebuilds from _latest.
+        self._latest_endpoint_counts: dict[Hashable, int] | None = {}
         self._fifo: dict[Hashable, deque[_PendingSend[MessageT]]] = defaultdict(deque)
         self._fifo_size = 0
         self._in_flight: _PendingSend[MessageT] | None = None
-        self._worker: threading.Thread | None = None
+        self._worker: WorkerThread | None = None
         self._draining_thread_id: int | None = None
         self._accepting = False
         self._generation = 0
@@ -184,9 +213,11 @@ class TransmitArbiter(Generic[MessageT]):
         self._service_sequence = 0
         self._last_served: dict[Hashable, int] = {}
         self._accepted = 0
-        self._dispatched = 0
         self._superseded = 0
-        self._failed = 0
+        # Dispatched, failed and the last accounted job sequence are committed
+        # together, so a process interrupt cannot separate counting from its
+        # cleanup marker. Keep only the sequence, never an idle endpoint owner.
+        self._completion_counts = (0, 0, 0)
         self._rejected_full = 0
         self._expired = 0
         self._rejected_stale = 0
@@ -202,17 +233,21 @@ class TransmitArbiter(Generic[MessageT]):
                 raise DeviceNotReadyError(
                     "transmit arbiter is already open for another generation"
                 )
-            if self._worker is not None and self._worker.is_alive():
+            if self._worker is not None and not self._worker.exited.is_set():
                 raise DeviceNotReadyError("transmit arbiter is still closing")
             if self._draining_thread_id is not None:
                 raise DeviceNotReadyError("transmit arbiter is still draining")
+            if self._cleanup_receipts.has_pending():
+                raise DeviceNotReadyError(
+                    "transmit arbiter has interrupted receipt cleanup; retry close()"
+                )
             self._generation = generation
             self._service_sequence = 0
             self._last_served.clear()
             self._accepting = True
             if self._mode is TransmitMode.CALLER:
                 return
-            worker = threading.Thread(
+            worker = WorkerThread(
                 target=self._run,
                 daemon=True,
                 name="LinkerbotTransmitArbiter.tx",
@@ -221,8 +256,10 @@ class TransmitArbiter(Generic[MessageT]):
             try:
                 worker.start()
             except BaseException:
-                self._worker = None
+                # start() can raise after OS creation, even before ident is
+                # visible. Keep the exit responsibility and forbid reopening.
                 self._accepting = False
+                self._condition.notify_all()
                 raise
 
     def close(self) -> None:
@@ -278,18 +315,18 @@ class TransmitArbiter(Generic[MessageT]):
         failure = normalize_error(error)
 
         with self._condition:
-            pending = self._take_endpoint_pending_locked(endpoint_id)
-            self._failed += len(pending)
+            pending = self._take_endpoint_pending_locked(endpoint_id, failure)
+            self._add_failed_locked(len(pending))
             self._condition.notify_all()
 
-        for job in pending:
-            job.receipt._fail(failure)
+        self._cleanup_receipts.fail_all(failure)
 
         deadline = self._monotonic() + timeout_s
         with self._condition:
             while (
                 self._in_flight is not None
                 and self._in_flight.options.endpoint_id == endpoint_id
+                and not self._in_flight.receipt.done()
             ):
                 remaining = deadline - self._monotonic()
                 if remaining <= 0:
@@ -403,8 +440,17 @@ class TransmitArbiter(Generic[MessageT]):
             )
             if options.policy is SendPolicy.LATEST:
                 previous = self._latest.get(latest_key)
-                self._latest[latest_key] = pending
-                if previous is not None:
+                if previous is None:
+                    counts = self._latest_endpoint_counts
+                    self._latest_endpoint_counts = None
+                    self._latest[latest_key] = pending
+                    if counts is not None:
+                        endpoint = options.endpoint_id
+                        counts[endpoint] = counts.get(endpoint, 0) + 1
+                    self._latest_endpoint_counts = counts
+                else:
+                    self._cleanup_receipts.register_superseded(previous.receipt)
+                    self._latest[latest_key] = pending
                     superseded = previous.receipt
                     self._superseded += 1
             else:
@@ -414,7 +460,7 @@ class TransmitArbiter(Generic[MessageT]):
             self._condition.notify()
 
         if superseded is not None:
-            superseded._supersede()
+            self._cleanup_receipts.supersede(superseded)
         return receipt
 
     def drain(self) -> None:
@@ -424,6 +470,9 @@ class TransmitArbiter(Generic[MessageT]):
         return immediately because that owner also observes work admitted while
         it is active. Worker mode already has a permanent owner, so calling this
         method there is a configuration error.
+
+        Process interrupts stop admission, fail the unsent work and propagate
+        to the caller. Already dispatched batch frames are never replayed.
         """
 
         if self._mode is not TransmitMode.CALLER:
@@ -504,6 +553,7 @@ class TransmitArbiter(Generic[MessageT]):
                 monotonic=self._monotonic,
             )
             self._next_sequence += 1
+            self._cleanup_receipts.register_superseded(previous.receipt)
             self._latest[latest_key] = _PendingSend(
                 message=message,
                 options=options,
@@ -515,8 +565,7 @@ class TransmitArbiter(Generic[MessageT]):
             self._superseded += 1
             self._condition.notify()
 
-        if not superseded._supersede():
-            raise RuntimeError("pending latest send was claimed outside arbiter lock")
+        self._cleanup_receipts.supersede(superseded)
         return receipt
 
     def submit_fifo(
@@ -545,29 +594,30 @@ class TransmitArbiter(Generic[MessageT]):
         with self._condition:
             oldest = self._oldest_accepted_locked()
             worker = self._worker
+            in_flight = self._in_flight
+            if in_flight is not None and in_flight.receipt.done():
+                in_flight = None
             running = self._accepting and (
                 self._mode is TransmitMode.CALLER
-                or (worker is not None and worker.is_alive())
+                or (worker is not None and not worker.exited.is_set())
             )
             return TransmitHealth(
                 running=running,
                 generation=self._generation,
                 pending_latest=len(self._latest),
                 pending_fifo=self._fifo_size,
-                in_flight=self._in_flight is not None,
+                in_flight=in_flight is not None,
                 accepted=self._accepted,
-                dispatched=self._dispatched,
+                dispatched=self._completion_counts[0],
                 superseded=self._superseded,
-                failed=self._failed,
+                failed=self._completion_counts[1],
                 rejected_full=self._rejected_full,
                 expired=self._expired,
                 rejected_stale=self._rejected_stale,
                 oldest_pending_age_s=(
                     None if oldest is None else max(0.0, self._monotonic() - oldest)
                 ),
-                in_flight_frames=(
-                    0 if self._in_flight is None else self._in_flight.frame_count
-                ),
+                in_flight_frames=(0 if in_flight is None else in_flight.frame_count),
             )
 
     def _stop(self, error: BaseException) -> None:
@@ -576,18 +626,19 @@ class TransmitArbiter(Generic[MessageT]):
             draining_thread_id = self._draining_thread_id
             if (
                 not self._accepting
-                and (worker is None or not worker.is_alive())
+                and (worker is None or worker.exited.is_set())
                 and draining_thread_id is None
+                and not self._has_pending_locked()
+                and not self._cleanup_receipts.has_pending()
             ):
                 self._worker = None
                 return
             self._accepting = False
-            pending = self._take_all_pending_locked()
-            self._failed += len(pending)
+            pending = self._take_all_pending_locked(error)
+            self._add_failed_locked(len(pending))
             self._condition.notify_all()
 
-        for job in pending:
-            job.receipt._fail(error)
+        self._cleanup_receipts.fail_all(error)
 
         if self._mode is TransmitMode.CALLER:
             if draining_thread_id == threading.get_ident():
@@ -605,8 +656,7 @@ class TransmitArbiter(Generic[MessageT]):
 
         if worker is None or worker is threading.current_thread():
             return
-        worker.join(timeout=self._join_timeout_s)
-        if worker.is_alive():
+        if not worker.exited.wait(timeout=self._join_timeout_s):
             raise TimeoutError("transmit arbiter worker did not stop in time")
         with self._condition:
             if self._worker is worker:
@@ -629,25 +679,33 @@ class TransmitArbiter(Generic[MessageT]):
         except BaseException as error:  # noqa: BLE001 - worker boundary must clean up
             unexpected = error
         finally:
-            with self._condition:
-                if unexpected is not None:
-                    self._accepting = False
-                    pending = self._take_all_pending_locked()
-                    orphaned = self._in_flight
-                    self._in_flight = None
-                    failed_count = len(pending)
-                    if orphaned is not None and not orphaned.receipt.done():
-                        failed_count += 1
-                    self._failed += failed_count
-                self._condition.notify_all()
             if unexpected is not None:
                 failure = TransportError(
                     f"transmit arbiter worker failed: {unexpected}", cause=unexpected
                 )
-                for job in pending:
-                    job.receipt._fail(failure)
-                if orphaned is not None:
-                    orphaned.receipt._fail(failure)
+            with self._condition:
+                if unexpected is not None:
+                    self._accepting = False
+                    pending = self._take_all_pending_locked(failure)
+                    orphaned = self._in_flight
+                    if orphaned is not None:
+                        self._cleanup_receipts.register_failed(
+                            orphaned.receipt, failure
+                        )
+                    self._in_flight = None
+                    failed_count = len(pending)
+                    if (
+                        orphaned is not None
+                        and not orphaned.receipt.done()
+                        and orphaned.sequence != self._completion_counts[2]
+                    ):
+                        failed_count += 1
+                    self._add_failed_locked(failed_count)
+                self._condition.notify_all()
+            if unexpected is not None:
+                # The worker failure is already observable in these receipts.
+                # A cleanup callback cannot replace it or orphan the suffix.
+                self._fail_detached(failure)
 
     def _drain_on_caller(self, current_thread_id: int) -> None:
         """Drain cooperatively without adding another persistent I/O thread."""
@@ -663,82 +721,225 @@ class TransmitArbiter(Generic[MessageT]):
                     job = self._claim_next_locked()
                 self._dispatch_claimed(job)
         except BaseException as error:  # noqa: BLE001 - scheduler boundary cleanup
-            with self._condition:
-                self._accepting = False
-                pending = self._take_all_pending_locked()
-                orphaned = self._in_flight
-                self._in_flight = None
-                failed_count = len(pending)
-                if orphaned is not None and not orphaned.receipt.done():
-                    failed_count += 1
-                self._failed += failed_count
-                if self._draining_thread_id == current_thread_id:
-                    self._draining_thread_id = None
-                self._condition.notify_all()
             failure = TransportError(
                 f"transmit arbiter caller failed: {error}", cause=error
             )
-            for job in pending:
-                job.receipt._fail(failure)
-            if orphaned is not None:
-                orphaned.receipt._fail(failure)
+            with self._condition:
+                self._accepting = False
+                pending = self._take_all_pending_locked(failure)
+                orphaned = self._in_flight
+                if orphaned is not None:
+                    self._cleanup_receipts.register_failed(orphaned.receipt, failure)
+                self._in_flight = None
+                failed_count = len(pending)
+                if (
+                    orphaned is not None
+                    and not orphaned.receipt.done()
+                    and orphaned.sequence != self._completion_counts[2]
+                ):
+                    failed_count += 1
+                self._add_failed_locked(failed_count)
+                if self._draining_thread_id == current_thread_id:
+                    self._draining_thread_id = None
+                self._condition.notify_all()
+            callback_error = self._fail_detached(failure)
+            if not isinstance(error, Exception):
+                raise
+            if callback_error is not None:
+                raise callback_error from error
+
+    def _fail_detached(self, error: BaseException) -> BaseException | None:
+        try:
+            self._cleanup_receipts.fail_all(error)
+        except BaseException as publication_error:
+            # The tracker retains any receipt interrupted before it became
+            # terminal; close() can retry without replacing its recorded cause.
+            return publication_error
+        return None
 
     def _dispatch_claimed(self, job: _PendingSend[MessageT]) -> None:
+        # Replacement may have committed its outcome just before a caller
+        # interrupt prevented the queue-slot update. Such a job must never
+        # become physical work when a worker later encounters the old slot.
+        if (
+            job.options.policy is SendPolicy.LATEST
+            and self._cleanup_receipts.is_superseded(job.receipt)
+        ):
+            try:
+                self._cleanup_receipts.supersede(job.receipt)
+            finally:
+                with self._condition:
+                    if job.receipt.done() and self._in_flight is job:
+                        self._in_flight = None
+                    self._condition.notify_all()
+            return
         failure: BaseException | None = None
+        interrupted: BaseException | None = None
         dispatched = False
         try:
-            deadline = job.options.deadline_at_s
-            if deadline is not None and deadline <= self._monotonic():
-                with self._condition:
-                    self._expired += 1
-                raise TimeoutError("send deadline expired before dispatch")
-            messages = (job.message,) if job.batch is None else job.batch
-            for index, message in enumerate(messages):
-                # Close can cancel the unsent suffix; it must not replay on open.
-                if index:
+            try:
+                deadline = job.options.deadline_at_s
+                if deadline is not None and deadline <= self._monotonic():
                     with self._condition:
-                        if not self._accepting:
-                            raise ClosedError("transmit closed during batch dispatch")
-                downstream = self._dispatch(message)
-                if not isinstance(downstream, SendReceipt):
-                    raise TransportError("dispatch must return SendReceipt")
-                result = downstream.result()
-                if result.outcome is not SendOutcome.DISPATCHED:
-                    raise TransportError(
-                        f"downstream send ended as {result.outcome.value}"
-                    )
-                if isinstance(job.receipt, BatchSendReceipt):
-                    job.receipt._frame_dispatched()
-            dispatched = True
-        except BaseException as error:  # noqa: BLE001 - receipt owns worker errors
-            failure = normalize_error(error)
+                        self._expired += 1
+                    raise TimeoutError("send deadline expired before dispatch")
+                messages = (job.message,) if job.batch is None else job.batch
+                batch_dispatch = self._dispatch_batch if len(messages) > 1 else None
+                block_size = 1 if batch_dispatch is None else _MAX_SEND_BATCH_FRAMES
+                for index in range(0, len(messages), block_size):
+                    # Close can cancel the unsent suffix; it must not replay on open.
+                    if index:
+                        with self._condition:
+                            if not self._accepting:
+                                raise ClosedError(
+                                    "transmit closed during batch dispatch"
+                                )
+                    if batch_dispatch is None:
+                        downstream = self._dispatch(messages[index])
+                    else:
+                        assert isinstance(job.receipt, BatchSendReceipt)
+                        block = messages[index : index + block_size]
 
-        if dispatched:
-            job.receipt._dispatch()
-        else:
-            if failure is None:
-                failure = TransportError("send failed without an error")
-            job.receipt._fail(failure)
+                        def record_progress(
+                            count: int, *, offset: int = index, size: int = len(block)
+                        ) -> None:
+                            if type(count) is not int or not 0 <= count <= size:
+                                raise ValidationError("invalid batch dispatch progress")
+                            job.receipt._set_sent_frames(offset + count)
+                            if count < size:
+                                with self._condition:
+                                    if not self._accepting:
+                                        raise ClosedError(
+                                            "transmit closed during batch dispatch"
+                                        )
 
-        with self._condition:
-            if self._in_flight is job:
-                self._in_flight = None
+                        downstream = batch_dispatch(
+                            block,
+                            expected_generation=job.receipt.generation,
+                            on_progress=record_progress,
+                        )
+                    if not isinstance(downstream, SendReceipt):
+                        raise TransportError("dispatch must return SendReceipt")
+                    if batch_dispatch is not None and (
+                        not isinstance(downstream, BatchSendReceipt)
+                        or downstream.frame_count != len(block)
+                        or downstream.generation != job.receipt.generation
+                    ):
+                        raise TransportError(
+                            "batch dispatch returned a mismatched receipt"
+                        )
+                    try:
+                        result = downstream.result()
+                    finally:
+                        if batch_dispatch is not None:
+                            job.receipt._set_sent_frames(index + downstream.sent_frames)
+                    if result.outcome is not SendOutcome.DISPATCHED:
+                        raise TransportError(
+                            f"downstream send ended as {result.outcome.value}"
+                        )
+                    if batch_dispatch is not None:
+                        if job.receipt.sent_frames != index + len(block):
+                            raise TransportError(
+                                "batch dispatch did not confirm all frames"
+                            )
+                    elif isinstance(job.receipt, BatchSendReceipt):
+                        job.receipt._frame_dispatched()
+                dispatched = True
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    # Full progress cannot override a failed or invalid receipt.
+                    failure = normalize_error(error)
+                elif (
+                    isinstance(job.receipt, BatchSendReceipt)
+                    and job.receipt.sent_frames == job.frame_count
+                ):
+                    # A process interrupt after final confirmation must preserve
+                    # success, propagate unchanged and stop later queued work.
+                    dispatched = True
+                    interrupted = error
+                else:
+                    raise
+
+            # Record physical completion before synchronous receipt callbacks.
+            # Keep the claimed job until publication is terminal, so interrupted
+            # completion accounting and publication can both retain its result.
+            with self._condition:
+                self._record_completion_locked(job, dispatched=dispatched)
+
             if dispatched:
-                self._dispatched += 1
+                job.receipt._dispatch()
             else:
-                self._failed += 1
-            self._condition.notify_all()
+                if failure is None:
+                    failure = TransportError("send failed without an error")
+                job.receipt._fail(failure)
+        except BaseException:
+            if dispatched and isinstance(job.receipt, BatchSendReceipt):
+                with self._condition:
+                    # Counting is idempotent if the first commit was interrupted.
+                    # Cleanup must publish success even if publication is
+                    # interrupted again and close() has to retry it later.
+                    self._record_completion_locked(job, dispatched=True)
+                    self._cleanup_receipts.register_succeeded(job.receipt)
+            if interrupted is not None:
+                raise interrupted
+            raise
+        finally:
+            # If publication itself was interrupted before becoming terminal,
+            # leave ownership to _run() / _drain_on_caller() cleanup.
+            with self._condition:
+                if job.receipt.done():
+                    if self._in_flight is job:
+                        self._in_flight = None
+                    self._forget_idle_endpoint_locked(job.options.endpoint_id)
+                self._condition.notify_all()
+
+        if interrupted is not None:
+            raise interrupted
+
+    def _record_completion_locked(
+        self, job: _PendingSend[MessageT], *, dispatched: bool
+    ) -> None:
+        sent_count, failed_count, sequence = self._completion_counts
+        if sequence != job.sequence:
+            self._completion_counts = (
+                sent_count + int(dispatched),
+                failed_count + int(not dispatched),
+                job.sequence,
+            )
+        self._condition.notify_all()
+
+    def _add_failed_locked(self, count: int) -> None:
+        sent_count, failed_count, sequence = self._completion_counts
+        self._completion_counts = (sent_count, failed_count + count, sequence)
 
     def _claim_next_locked(self) -> _PendingSend[MessageT]:
         now = self._monotonic()
-        candidates = list(self._latest.values())
-        candidates.extend(queue[0] for queue in self._fifo.values() if queue)
-        job = min(candidates, key=lambda candidate: self._rank(candidate, now))
+        candidates = chain(
+            self._latest.values(), (queue[0] for queue in self._fifo.values() if queue)
+        )
+        job = next(candidates)
+        best_rank = self._rank(job, now)
+        for candidate in candidates:
+            rank = self._rank(candidate, now)
+            if rank < best_rank:
+                job, best_rank = candidate, rank
 
+        # Transfer cleanup ownership before removing the job from its queue.
+        # An interrupt during removal must leave the receipt reachable.
+        self._in_flight = job
         options = job.options
         if options.policy is SendPolicy.LATEST:
             key = (options.endpoint_id, options.command_family)
+            counts = self._latest_endpoint_counts
+            self._latest_endpoint_counts = None
             del self._latest[key]
+            if counts is not None:
+                remaining = counts[options.endpoint_id] - 1
+                if remaining:
+                    counts[options.endpoint_id] = remaining
+                else:
+                    del counts[options.endpoint_id]
+            self._latest_endpoint_counts = counts
         else:
             queue = self._fifo[options.endpoint_id]
             claimed = queue.popleft()
@@ -748,11 +949,14 @@ class TransmitArbiter(Generic[MessageT]):
             if not queue:
                 del self._fifo[options.endpoint_id]
 
+        if options.policy is SendPolicy.LATEST and self._cleanup_receipts.is_superseded(
+            job.receipt
+        ):
+            return job
         if not job.receipt._claim():
             raise RuntimeError("pending send completed before transport claim")
         self._service_sequence += 1
         self._last_served[options.endpoint_id] = self._service_sequence
-        self._in_flight = job
         return job
 
     def _rank(self, job: _PendingSend[MessageT], now: float) -> tuple[float, ...]:
@@ -770,29 +974,73 @@ class TransmitArbiter(Generic[MessageT]):
     def _oldest_accepted_locked(self) -> float | None:
         heads = list(self._latest.values())
         heads.extend(queue[0] for queue in self._fifo.values() if queue)
-        if self._in_flight is not None:
+        if self._in_flight is not None and not self._in_flight.receipt.done():
             heads.append(self._in_flight)
         return min((job.receipt.accepted_at_s for job in heads), default=None)
 
-    def _take_all_pending_locked(self) -> tuple[_PendingSend[MessageT], ...]:
-        pending = list(self._latest.values())
-        self._latest.clear()
+    def _take_all_pending_locked(
+        self, error: BaseException
+    ) -> tuple[_PendingSend[MessageT], ...]:
+        pending = [job for job in self._latest.values() if job is not self._in_flight]
         for queue in self._fifo.values():
-            pending.extend(queue)
+            pending.extend(job for job in queue if job is not self._in_flight)
+        for job in pending:
+            self._cleanup_receipts.register_failed(job.receipt, error)
+        self._latest_endpoint_counts = None
+        self._latest.clear()
+        self._latest_endpoint_counts = {}
         self._fifo.clear()
         self._fifo_size = 0
+        self._last_served.clear()
         return tuple(pending)
 
     def _take_endpoint_pending_locked(
-        self, endpoint_id: Hashable
+        self, endpoint_id: Hashable, error: BaseException
     ) -> tuple[_PendingSend[MessageT], ...]:
         latest_keys = tuple(key for key in self._latest if key[0] == endpoint_id)
-        pending = [self._latest.pop(key) for key in latest_keys]
-        fifo = self._fifo.pop(endpoint_id, None)
+        pending = [self._latest[key] for key in latest_keys]
+        fifo = self._fifo.get(endpoint_id)
         if fifo is not None:
             pending.extend(fifo)
+        for job in pending:
+            self._cleanup_receipts.register_failed(job.receipt, error)
+        counts = self._latest_endpoint_counts
+        self._latest_endpoint_counts = None
+        for key in latest_keys:
+            del self._latest[key]
+            # Only removed jobs change membership; a non-reflexive endpoint
+            # can match no latest keys despite being present in the cache.
+            if counts is not None:
+                endpoint = key[0]
+                remaining = counts[endpoint] - 1
+                if remaining:
+                    counts[endpoint] = remaining
+                else:
+                    del counts[endpoint]
+        self._latest_endpoint_counts = counts
+        if fifo is not None:
+            self._fifo.pop(endpoint_id)
             self._fifo_size -= sum(job.frame_count for job in fifo)
+        self._forget_idle_endpoint_locked(endpoint_id)
         return tuple(pending)
+
+    def _forget_idle_endpoint_locked(self, endpoint_id: Hashable) -> None:
+        if endpoint_id in self._fifo:
+            return
+        counts = self._latest_endpoint_counts
+        if counts is None:
+            counts = {}
+            for endpoint, _ in self._latest:
+                counts[endpoint] = counts.get(endpoint, 0) + 1
+            self._latest_endpoint_counts = counts
+        if endpoint_id in counts:
+            return
+        if (
+            self._in_flight is not None
+            and self._in_flight.options.endpoint_id == endpoint_id
+        ):
+            return
+        self._last_served.pop(endpoint_id, None)
 
 
 def _validate_hashable(value: Hashable, name: str) -> None:

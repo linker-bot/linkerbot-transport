@@ -48,16 +48,18 @@ if TYPE_CHECKING:
 class _LinkState:
     """Decoded SocketCAN link state from ``ip -d -j link show``."""
 
-    __slots__ = ("up", "fd", "bitrate", "data_bitrate")
+    __slots__ = ("kind", "up", "fd", "bitrate", "data_bitrate")
 
     def __init__(
         self,
         *,
+        kind: str | None,
         up: bool,
         fd: bool,
         bitrate: int | None,
         data_bitrate: int | None,
     ) -> None:
+        self.kind = kind
         self.up = up
         self.fd = fd
         self.bitrate = bitrate
@@ -140,6 +142,13 @@ class SocketCANFDBackend(PythonCANFDBackend):
                 f"  {setup_cmd}\n"
                 f"or pass auto_reconfigure=True (requires CAP_NET_ADMIN)."
             )
+        # A mismatched name may belong to Ethernet, a bridge or vcan. Never
+        # take an existing interface down until its CAN kind is confirmed.
+        if state.kind != "can":
+            raise TransportError(
+                f"SocketCAN channel {self._channel!r} is not a CAN interface "
+                f"(kind={state.kind!r}); refusing to change its configuration"
+            )
         if state.matches(
             bitrate=self._bitrate, data_bitrate=self._data_bitrate, fd=self._fd
         ):
@@ -192,6 +201,8 @@ def _format_setup_command(
     ]
     if fd:
         parts.append(f"dbitrate {data_bitrate} fd on")
+    else:
+        parts.append("fd off")
     return " ".join(parts)
 
 
@@ -236,6 +247,7 @@ def _read_link_state(channel: str) -> _LinkState | None:
     ctrlmode = info_data.get("ctrlmode") or []
     fd = "FD" in ctrlmode
     return _LinkState(
+        kind=linkinfo.get("info_kind"),
         up=up,
         fd=fd,
         bitrate=bittiming.get("bitrate"),
@@ -251,6 +263,8 @@ def _bring_up(channel: str, bitrate: int, data_bitrate: int, fd: bool) -> None:
     args = ["link", "set", channel, "up", "type", "can", "bitrate", str(bitrate)]
     if fd:
         args += ["dbitrate", str(data_bitrate), "fd", "on"]
+    else:
+        args += ["fd", "off"]
     _run_ip(args)
 
 

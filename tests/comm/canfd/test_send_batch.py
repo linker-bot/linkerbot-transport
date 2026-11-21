@@ -22,8 +22,8 @@ from collections.abc import Callable
 
 import pytest
 
-from linkerbot_transport import SendOutcome
-from linkerbot_transport.canfd import CANFDMessage
+from linkerbot_transport import SendOutcome, TransmitArbiter, TransmitMode
+from linkerbot_transport.canfd import CANFDMessage, CANFDTransport
 from linkerbot_transport.canfd import ctypes_backend as backend
 from linkerbot_transport.canfd.dispatcher import CANFDMessageDispatcher
 from linkerbot_transport.errors import TransportError, ValidationError
@@ -61,11 +61,11 @@ class _FakeLib:
 @pytest.fixture(autouse=True)
 def _reset_lifecycle_state():
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
     yield
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
 
 
@@ -164,6 +164,72 @@ def test_send_batch_short_send_raises(monkeypatch: pytest.MonkeyPatch) -> None:
             [CANFDMessage(arbitration_id=i + 1, data=b"x") for i in range(5)]
         )
     interface.close()
+
+
+@pytest.mark.parametrize("short_second_block", [False, True])
+def test_explicit_fifo_batch_reaches_native_abi_in_bounded_blocks(
+    monkeypatch: pytest.MonkeyPatch, short_second_block: bool
+) -> None:
+    interface, lib = _make(monkeypatch)
+    received, calls = [], []
+    rx_idle = threading.Event()
+
+    def receive(dev, channel, buffer, capacity, timeout_ms):
+        rx_idle.wait(timeout_ms / 1000)
+        return 0
+
+    def transmit(dev, channel, buffer, count, timeout_ms):
+        calls.append(count)
+        actual = count - 1 if short_second_block and len(calls) == 2 else count
+        received.extend(buffer[index].ID for index in range(actual))
+        return actual
+
+    lib.CANFD_Receive._hook = receive
+    lib.CANFD_Transmit._hook = transmit
+    dispatchers = []
+
+    def factory(on_error):
+        dispatcher = CANFDMessageDispatcher(
+            interface=interface, on_bus_error=on_error, start_send_worker=False
+        )
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    transport = CANFDTransport(dispatcher_factory=factory)
+    transport.open()
+    arbiter = TransmitArbiter(
+        transport.send,
+        dispatch_batch=transport.send_batch,
+        mode=TransmitMode.CALLER,
+    )
+    arbiter.open(generation=transport.get_health().generation)
+    try:
+        receipt = arbiter.submit_fifo_batch(
+            [CANFDMessage(index + 1, b"abcd") for index in range(51)],
+            endpoint_id="arm",
+        )
+        arbiter.drain()
+        assert calls == [32, 19]
+        if short_second_block:
+            assert isinstance(receipt.exception(0), TransportError)
+            assert receipt.sent_frames == 32
+            # The failed block may have physical effects. Do not infer a
+            # replay offset from the confirmed-prefix count.
+            assert received == list(range(1, 51))
+        else:
+            assert receipt.result(0).outcome is SendOutcome.DISPATCHED
+            assert receipt.sent_frames == 51
+            assert received == list(range(1, 52))
+        health = transport.get_health()
+        assert health.tx_frames == receipt.sent_frames
+        assert health.tx_bytes == receipt.sent_frames * 4
+        assert dispatchers[0]._send_thread.ident is None
+    finally:
+        rx_idle.set()
+        arbiter.close()
+        transport.close()
+        assert not dispatchers[0]._recv_thread.is_alive()
+        assert not dispatchers[0]._send_thread.is_alive()
 
 
 def test_send_batch_exceeds_vendor_limit_rejected(

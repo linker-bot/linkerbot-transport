@@ -6,7 +6,7 @@ import logging
 import math
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .errors import TransportError, ValidationError
@@ -65,10 +65,37 @@ def positive_int(value: int, name: str) -> None:
         raise ValidationError(f"{name} must be a positive int")
 
 
+def normalize_channel_options(
+    channel: str, interface: str, bus_options: Mapping[str, BusOption] | None
+) -> tuple[str, tuple[tuple[str, BusOption], ...]]:
+    """Resolve the SLCAN port@baud spelling before keys, claims or driver I/O."""
+    validate_channel(channel, interface)
+    options = dict(freeze_bus_options(bus_options))
+    if interface == "slcan":
+        if "@" in channel:
+            channel, baud = channel.rsplit("@", 1)
+            try:
+                serial_baud = int(baud)
+            except ValueError as error:
+                raise ValidationError("invalid SLCAN channel@baudrate") from error
+            if "@" in channel:
+                raise ValidationError("invalid SLCAN channel@baudrate")
+            if "tty_baudrate" in options and options["tty_baudrate"] != serial_baud:
+                raise ValidationError("conflicting SLCAN serial baudrates")
+            options["tty_baudrate"] = serial_baud
+        validate_channel(channel, interface)
+        positive_int(options.setdefault("tty_baudrate", 115_200), "tty_baudrate")
+    return channel, freeze_bus_options(options)
+
+
 @dataclass
 class _ChannelUse:
     settings: object
-    count: int = 1
+    owners: set[object] = field(default_factory=set)
+
+    @property
+    def count(self) -> int:
+        return len(self.owners)
 
 
 _CHANNEL_LOCK = threading.Lock()
@@ -87,7 +114,7 @@ class ChannelClaim:
         if interface in ("pcan", "slcan") and not channel.startswith("/"):
             channel = channel.upper()
         self._key = (interface, channel)
-        self._released = False
+        self._token = object()
         with _CHANNEL_LOCK:
             current = _CHANNELS.get(self._key)
             if current is not None:
@@ -96,19 +123,23 @@ class ChannelClaim:
                         f"{interface} channel {channel!r} is already open with "
                         "different settings; close its users before reconfiguring"
                     )
-                current.count += 1
             else:
-                _CHANNELS[self._key] = _ChannelUse(settings)
+                current = _ChannelUse(settings)
+                _CHANNELS[self._key] = current
+            self._use = current
+            current.owners.add(self._token)
+
+    @property
+    def _released(self) -> bool:
+        return self._token not in self._use.owners
 
     def release(self) -> None:
         with _CHANNEL_LOCK:
-            if self._released:
-                return
-            current = _CHANNELS[self._key]
-            current.count -= 1
-            if current.count == 0:
-                del _CHANNELS[self._key]
-            self._released = True
+            # One owner-specific idempotent mutation replaces count/flag writes.
+            # Retrying after an interrupt cannot consume another handle's claim.
+            self._use.owners.discard(self._token)
+            if not self._use.owners and _CHANNELS.get(self._key) is self._use:
+                _CHANNELS.pop(self._key, None)
 
 
 def open_bus(*, channel: str, interface: str, **kwargs: Any) -> can.BusABC:
@@ -134,9 +165,6 @@ def open_bus(*, channel: str, interface: str, **kwargs: Any) -> can.BusABC:
 def rollback_bus_open(error: BaseException, claim: ChannelClaim) -> None:
     """Retain partially constructed buses until their resources are released."""
     bus = getattr(error, "_failed_bus", None)
-    if bus is None:
-        claim.release()
-        return
     owner = _FailedBusCleanup(bus, claim)
     try:
         owner.stop()
@@ -152,7 +180,7 @@ def rollback_bus_open(error: BaseException, claim: ChannelClaim) -> None:
 class _FailedBusCleanup:
     """Cleanup-only dispatcher for a bus that failed before workers existed."""
 
-    def __init__(self, bus: can.BusABC, claim: ChannelClaim) -> None:
+    def __init__(self, bus: can.BusABC | None, claim: ChannelClaim) -> None:
         self._bus = bus
         self._claim = claim
         self._lock = threading.Lock()
@@ -161,9 +189,10 @@ class _FailedBusCleanup:
     def stop(self) -> None:
         with self._lock:
             if not self._closed:
-                self._bus.shutdown()
-                self._claim.release()
+                if self._bus is not None:
+                    self._bus.shutdown()
                 self._closed = True
+            self._claim.release()
 
     def unsubscribe(self, callback: object) -> None:
         # No worker or subscription was created during the failed open.

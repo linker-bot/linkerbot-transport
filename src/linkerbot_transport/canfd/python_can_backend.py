@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import math
 import threading
 from collections.abc import Callable, Mapping
@@ -13,12 +14,18 @@ from linkerbot_transport._python_can import (
     BusOption,
     ChannelClaim,
     freeze_bus_options,
+    normalize_channel_options,
     open_bus,
     positive_int,
     rollback_bus_open,
     validate_channel,
 )
-from linkerbot_transport.errors import LinkerbotError, TransportError, ValidationError
+from linkerbot_transport.errors import (
+    LinkerbotError,
+    TimeoutError,
+    TransportError,
+    ValidationError,
+)
 
 from .types import CANFDMessage, dlc_to_length, length_to_dlc
 
@@ -47,7 +54,10 @@ def resolve_fd_options(
     for name, value in (("fd", fd), ("receive_own_messages", receive_own_messages)):
         if not isinstance(value, bool):
             raise ValidationError(f"{name} must be bool")
-    options = dict(freeze_bus_options(bus_options))
+    channel, normalized_options = normalize_channel_options(
+        channel, interface, bus_options
+    )
+    options = dict(normalized_options)
     if interface == "slcan":
         if bitrate not in (
             10_000,
@@ -63,23 +73,6 @@ def resolve_fd_options(
             raise ValidationError(
                 "nominal bitrate is not supported by python-can SLCAN"
             )
-        if "@" in channel:
-            channel, baud = channel.rsplit("@", 1)
-            try:
-                serial_baud = int(baud)
-            except ValueError as error:
-                raise ValidationError("invalid SLCAN channel@baudrate") from error
-            if "tty_baudrate" in options and options["tty_baudrate"] != serial_baud:
-                raise ValidationError("conflicting SLCAN serial baudrates")
-            options["tty_baudrate"] = serial_baud
-        validate_channel(channel, interface)
-        serial_baud = options.setdefault("tty_baudrate", 115_200)
-        if (
-            not isinstance(serial_baud, int)
-            or isinstance(serial_baud, bool)
-            or serial_baud <= 0
-        ):
-            raise ValidationError("tty_baudrate must be a positive int")
         if fd:
             if data_bitrate not in (2_000_000, 5_000_000):
                 raise ValidationError(
@@ -227,6 +220,10 @@ class PythonCANFDBackend:
                 ),
                 timeout=timeout_ms / 1000,
             )
+        except (can.CanTimeoutError, builtins.TimeoutError) as error:
+            raise TimeoutError(
+                f"{self._interface} CAN FD send timed out: {error}", cause=error
+            ) from error
         except (can.CanError, OSError) as error:
             raise TransportError(
                 f"{self._interface} CAN FD send failed: {error}", cause=error
@@ -277,6 +274,7 @@ class PythonCANFDBackend:
     def close(self) -> None:
         with self._lock:
             if self._closed:
+                self._claim.release()
                 return
             try:
                 self._bus.shutdown()

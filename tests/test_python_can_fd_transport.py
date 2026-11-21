@@ -231,8 +231,8 @@ def test_startup_interruption_retains_failed_cleanup_for_retry(monkeypatch):
     original_close = PythonCANFDBackend.close
     created = []
 
-    def fail_second_start(thread):
-        if thread.name == "CANFDMessageDispatcher.send_loop":
+    def fail_worker_start(thread):
+        if thread.name == "CANFDMessageDispatcher.recv_loop":
             raise KeyboardInterrupt("interrupted startup")
         original_start(thread)
 
@@ -240,7 +240,7 @@ def test_startup_interruption_retains_failed_cleanup_for_retry(monkeypatch):
         created.append(backend)
         raise OSError("USB shutdown failed")
 
-    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    monkeypatch.setattr(threading.Thread, "start", fail_worker_start)
     monkeypatch.setattr(PythonCANFDBackend, "close", fail_close)
     transport = PythonCANFDTransport("fd-startup", "virtual")
     with pytest.raises(KeyboardInterrupt, match="startup"):

@@ -26,11 +26,14 @@ import logging
 import os
 import platform
 import threading
-from dataclasses import dataclass
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from linkerbot_transport.errors import TransportError, ValidationError
+from linkerbot_transport.errors import TimeoutError, TransportError, ValidationError
 
 from .types import CANFDConfigOptions, CANFDMessage, dlc_to_length
 
@@ -48,6 +51,11 @@ CANFD_EXTENDED_FRAME_FLAG = 1
 CANFD_STANDARD_FRAME_FLAG = 0
 CANFD_REMOTE_FRAME_DISABLED = 0
 CANFD_STATUS_OK = 0
+# Vendor V1.3 tables 1-3: transfer direction/failure and bus diagnostics.
+_FRAME_TRANSMITTED = 0x01
+_FRAME_FAILED = 0x02
+# Normal bus (0x08) and empty TX mailbox (0x20) are not error indicators.
+_BUS_DIAGNOSTIC_MASK = 0x01 | 0x02 | 0x04 | 0x10 | 0x40 | 0x80
 CANFD_SCAN_NO_DEVICE = 0
 CANFD_FRAME_DATA_SIZE = 64
 _DEV_INFO_FIELD_LENGTH = 32
@@ -56,6 +64,8 @@ _ENV_LIBRARY_PATH = "LINKERBOT_CANFD_LIB"
 _LINUX_LIBRARY_NAME = "libcanbus.so"
 _WINDOWS_LIBRARY_NAME = "HCanbus.dll"
 _LINUX_USB_LIBRARY_NAME = "libusb-1.0.so.0"
+# One budget shared by all Python lock waits in a native close attempt.
+_CLOSE_WAIT_TIMEOUT_S = 1.0
 
 _logger = logging.getLogger(__name__)
 
@@ -66,7 +76,7 @@ _dependency_load_lock = threading.Lock()
 _dependency_preload_attempted: set[str] = set()
 _dependency_handle_cache: dict[str, Any] = {}
 _lifecycle_lock = threading.Lock()
-_lifecycle_refcount: dict[str, int] = {}
+_lifecycle_references: dict[str, set[object]] = {}
 _lifecycle_lib: dict[str, Any] = {}
 # Scanning can replace vendor-global channel tables. Coordinate it with opens
 # and closes, and reject public enumeration while channels still own handles.
@@ -79,7 +89,12 @@ _finalize_safe = True
 @dataclass
 class _LifecycleReference:
     key: str
-    released: bool = False
+    owners: set[object]
+    token: object = field(default_factory=object)
+
+    @property
+    def released(self) -> bool:
+        return self.token not in self.owners
 
 
 def _canonical_library_key(candidate: str | Path) -> str:
@@ -168,8 +183,8 @@ def _lifecycle_acquire(lib: Any) -> _LifecycleReference | None:
         return None
     key = _library_key(lib)
     with _lifecycle_lock:
-        count = _lifecycle_refcount.get(key, 0)
-        if count == 0:
+        owners = _lifecycle_references.get(key)
+        if not owners:
             pending = _lifecycle_lib.get(key)
             if pending is not None:
                 error = _exit_library(pending)
@@ -180,11 +195,35 @@ def _lifecycle_acquire(lib: Any) -> _LifecycleReference | None:
             if status != CANFD_STATUS_OK:
                 raise TransportError(f"LibCANbus_Init failed with status {status}")
             _lifecycle_lib[key] = lib
-        _lifecycle_refcount[key] = count + 1
-        return _LifecycleReference(key)
+        if owners is None:
+            owners = set()
+            _lifecycle_references[key] = owners
+        ref = _LifecycleReference(key, owners)
+        owners.add(ref.token)
+        return ref
 
 
-def _lifecycle_release(ref: _LifecycleReference | None) -> TransportError | None:
+@contextmanager
+def _close_lock_before(lock: Any, deadline: float | None, phase: str) -> Iterator[None]:
+    acquired = (
+        lock.acquire()
+        if deadline is None
+        else lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+    )
+    if not acquired:
+        raise TimeoutError(
+            f"MiniCANFD close timed out waiting for {phase}; "
+            "cleanup ownership retained, retry close() after the operation returns"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _lifecycle_release(
+    ref: _LifecycleReference | None, *, deadline: float | None = None
+) -> TransportError | None:
     """Release once and retry pending Exit without consuming another reference.
 
     An Exit failure is returned and logged. Both a repeated close and the next
@@ -193,18 +232,17 @@ def _lifecycle_release(ref: _LifecycleReference | None) -> TransportError | None
     """
     if ref is None or not _finalize_safe:
         return
-    with _lifecycle_lock:
+    with _close_lock_before(_lifecycle_lock, deadline, "library lifecycle"):
         key = ref.key
-        count = _lifecycle_refcount.get(key, 0)
-        if not ref.released:
-            ref.released = True
-            count = max(0, count - 1)
-            if count:
-                _lifecycle_refcount[key] = count
-            else:
-                _lifecycle_refcount.pop(key, None)
-        if count > 0:
-            return
+        owners = _lifecycle_references.get(key)
+        if owners is not None and owners is not ref.owners:
+            # A newer Init owns this key; a stale released reference cannot
+            # decrement it or call Exit underneath its active users.
+            return None
+        ref.owners.discard(ref.token)
+        if ref.owners:
+            return None
+        _lifecycle_references.pop(key, None)
         lib = _lifecycle_lib.get(key)
         if lib is None:
             return
@@ -233,7 +271,7 @@ def _exit_library(lib: Any) -> TransportError | None:
 def _lifecycle_snapshot() -> dict[str, int]:
     """Return a copy of the current refcount table (testing helper)."""
     with _lifecycle_lock:
-        return dict(_lifecycle_refcount)
+        return {key: len(owners) for key, owners in _lifecycle_references.items()}
 
 
 class CanFDConfig(ctypes.Structure):
@@ -305,20 +343,22 @@ class CANFDInterface:
 
     Close contract (mandatory ordering, encoded in :meth:`close`):
 
-    1. Under ``_state_lock``, flip ``_closed_event`` and snapshot the previous
-       state. Subsequent ``send/receive/read_dev_info`` calls fail fast.
+    1. Under ``_state_lock``, flip ``_closed_event``. Subsequent
+       ``send/receive/read_dev_info`` calls fail fast.
     2. Briefly acquire ``_tx_lock`` then ``_rx_lock``. Any in-flight call from
        another thread has the matching lock; reacquiring forces ``close()`` to
-       wait until the vendor call returns. With send timeout 10 ms and
-       receive timeout 10 ms, the worst-case drain is ~20 ms.
+       wait until the vendor call returns. All Python lock waits in one close
+       attempt share a one-second budget. Expiry reports a retryable timeout,
+       retaining resources still owned by in-flight operations.
     3. Call ``CAN_CloseDevice``. A failed call retains ownership so a later
        ``close()`` can retry it.
     4. After the first successful device close, release the lifecycle refcount
        and notify concurrent close callers.
 
     When a dispatcher owns the interface, ``dispatcher.stop()`` first gives
-    both workers a bounded join. If either is still running it closes the
-    interface to interrupt pending I/O, then joins the workers again.
+    both workers a bounded join and then requests interface close. A native
+    I/O call that ignores its timeout is never interrupted by concurrent
+    resource release. Native close/Exit calls themselves cannot be preempted.
     """
 
     def __init__(
@@ -377,6 +417,10 @@ class CANFDInterface:
         self._closed_event.set()
         self._close_complete_event.set()
         self._lifecycle_ref: _LifecycleReference | None = None
+        self._pending_receive_buffer: ctypes.Array[CanFDMsg] | None = None
+        self._pending_receive_index = 0
+        self._pending_receive_count = 0
+        self._pending_receive_error: Exception | None = None
         self._lib = _load_library(library_path)
         _bind_signatures(self._lib, windows=self._windows)
         # Hot-path zero-alloc buffers. The TX frame is reused across every
@@ -398,11 +442,16 @@ class CANFDInterface:
         except BaseException as error:
             try:
                 self.close()
-            except BaseException:
+            except BaseException as cleanup_error:
                 _logger.exception(
                     "CAN FD initialization cleanup failed; close must retry"
                 )
                 setattr(error, "_failed_interface", self)
+                if isinstance(error, Exception) and not isinstance(
+                    cleanup_error, Exception
+                ):
+                    setattr(cleanup_error, "_failed_interface", self)
+                    raise cleanup_error from error
             raise
 
     @property
@@ -578,7 +627,7 @@ class CANFDInterface:
         max_frames: int = CANFD_DEFAULT_MAX_RECEIVE_FRAMES,
         timeout_ms: int = CANFD_DEFAULT_RECEIVE_TIMEOUT_MS,
     ) -> list[CANFDMessage]:
-        """Receive up to max_frames CANFD frames from the vendor library.
+        """Deliver up to max_frames data frames in native receive order.
 
         Holds ``_rx_lock`` only — independent of send. The vendor library is
         single-reader per channel, so the lock prevents accidental concurrent
@@ -588,7 +637,14 @@ class CANFDInterface:
         capacity (the common case — the dispatcher uses the default). Larger
         requests allocate a fresh array. Returned messages are independent
         immutable copies, so callers may keep them after the next receive
-        overwrites the buffer.
+        overwrites the buffer. RTR and transmit echoes have no device reply.
+
+        Before reporting a later frame error, deliver the valid prefix. The
+        error is raised on the next valid call, before consuming the retained
+        batch suffix or reading the driver again. At most one native batch is
+        retained, and a smaller max_frames also bounds delivery of that suffix.
+        Successful data carrying a bus diagnostic is delivered before reporting
+        that diagnostic; the snapshot does not make its payload invalid.
         """
         if (
             not isinstance(max_frames, int)
@@ -604,26 +660,58 @@ class CANFDInterface:
         self._ensure_open()
         with self._rx_lock:
             self._ensure_open()
-            if max_frames <= CANFD_DEFAULT_MAX_RECEIVE_FRAMES:
-                buffer = self._rx_buffer
-            else:
-                buffer = (CanFDMsg * max_frames)()
-            received = self._lib.CANFD_Receive(
-                *self._channel_args,
-                buffer,
-                max_frames,
-                timeout_ms,
-            )
-            if received < CANFD_STATUS_OK:
-                raise TransportError(f"CANFD_Receive failed with status {received}")
-            if received == CANFD_STATUS_OK:
-                return []
-            if received > max_frames:
-                raise TransportError(
-                    "CANFD_Receive returned more frames than requested: "
-                    f"requested {max_frames}, got {received}"
+            if self._pending_receive_error is not None:
+                error = self._pending_receive_error
+                self._pending_receive_error = None
+                raise error
+            if self._pending_receive_buffer is None:
+                if max_frames <= CANFD_DEFAULT_MAX_RECEIVE_FRAMES:
+                    buffer = self._rx_buffer
+                else:
+                    buffer = (CanFDMsg * max_frames)()
+                received = self._lib.CANFD_Receive(
+                    *self._channel_args,
+                    buffer,
+                    max_frames,
+                    timeout_ms,
                 )
-            return [self._frame_to_message(buffer[i]) for i in range(received)]
+                if received < CANFD_STATUS_OK:
+                    raise TransportError(f"CANFD_Receive failed with status {received}")
+                if received == CANFD_STATUS_OK:
+                    return []
+                if received > max_frames:
+                    raise TransportError(
+                        "CANFD_Receive returned more frames than requested: "
+                        f"requested {max_frames}, got {received}"
+                    )
+                self._pending_receive_buffer = buffer
+                self._pending_receive_index = 0
+                self._pending_receive_count = received
+
+            result = []
+            remaining = self._pending_receive_count - self._pending_receive_index
+            try:
+                for _ in range(min(max_frames, remaining)):
+                    frame = self._pending_receive_buffer[self._pending_receive_index]
+                    # Consume exactly once, even when decoding raises. The
+                    # native batch has already left the adapter's queue.
+                    self._pending_receive_index += 1
+                    message = self._frame_to_message(frame)
+                    if message is not None:
+                        result.append(message)
+                    if frame.BusSatus & _BUS_DIAGNOSTIC_MASK or frame.ErrSatus:
+                        raise self._frame_receive_error(frame)
+            except Exception as error:
+                if not result:
+                    raise
+                # Retain the exception without its receive-frame locals, which
+                # would otherwise keep an exhausted large native array alive.
+                self._pending_receive_error = error.with_traceback(None)
+            finally:
+                if self._pending_receive_index == self._pending_receive_count:
+                    self._pending_receive_buffer = None
+                    self._pending_receive_index = self._pending_receive_count = 0
+            return result
 
     def read_dev_info(self) -> dict[str, str]:
         """Read USB-CANFD adapter information from the vendor library.
@@ -653,10 +741,10 @@ class CANFDInterface:
 
         1. Flip ``_closed_event`` under ``_state_lock``; from this point any
            future send/receive call from any thread fails fast.
-        2. Drain in-flight send/receive by briefly acquiring ``_tx_lock`` and
-           ``_rx_lock``. Any thread that entered the vendor call before step 1
-           will return within its bounded timeout (≤10 ms each) and release
-           the lock; close then proceeds.
+        2. Drain in-flight send/receive by acquiring ``_tx_lock`` and
+           ``_rx_lock``. Concurrent-close, I/O, enumeration and lifecycle lock
+           waits share one budget; expiry raises ``TimeoutError`` without
+           releasing resources still in use. New I/O stays rejected.
         3. Call ``CAN_CloseDevice``.
         4. On success, release the lifecycle refcount and notify concurrent
            close callers.
@@ -665,27 +753,36 @@ class CANFDInterface:
         lifecycle ownership so a later ``close()`` can retry the vendor call.
         A later ``LibCANbus_Exit`` failure is also reported and retryable without
         closing the already released channel or decrementing its reference twice.
+        Native cleanup calls themselves cannot be preempted in this process;
+        the deadline bounds Python lock waits, not vendor close/Exit execution.
         """
         # Serialize the full transaction. A caller arriving after a failed
         # attempt becomes the next owner and retries CAN_CloseDevice instead of
         # confusing "I/O rejected" with "vendor resources released".
-        with self._close_lock:
+        deadline = time.monotonic() + _CLOSE_WAIT_TIMEOUT_S
+        with _close_lock_before(self._close_lock, deadline, "another close attempt"):
             if self._close_succeeded:
                 return
-            with self._state_lock:
+            with _close_lock_before(self._state_lock, deadline, "interface state"):
                 self._closed_event.set()
             self._close_complete_event.clear()
             try:
                 # Step 2: drain. Acquiring then immediately releasing each
                 # direction lock waits out any in-flight vendor call.
-                with self._tx_lock:
+                with _close_lock_before(self._tx_lock, deadline, "transmit I/O"):
                     pass
-                with self._rx_lock:
-                    pass
+                with _close_lock_before(self._rx_lock, deadline, "receive I/O"):
+                    # Once admission is closed, old data and deferred errors
+                    # must not survive even a failed native-close attempt.
+                    self._pending_receive_buffer = None
+                    self._pending_receive_index = self._pending_receive_count = 0
+                    self._pending_receive_error = None
 
                 # Step 3: actually close the vendor side.
                 if self._device_open:
-                    with _enumeration_lock:
+                    with _close_lock_before(
+                        _enumeration_lock, deadline, "library enumeration"
+                    ):
                         try:
                             close_status = self._lib.CAN_CloseDevice(
                                 *self._channel_args
@@ -709,7 +806,9 @@ class CANFDInterface:
 
                 # Step 4: a successful vendor close commits lifecycle release.
                 if self._lifecycle_ref is not None:
-                    cleanup_error = _lifecycle_release(self._lifecycle_ref)
+                    cleanup_error = _lifecycle_release(
+                        self._lifecycle_ref, deadline=deadline
+                    )
                     if cleanup_error is not None:
                         raise cleanup_error
                     self._lifecycle_ref = None
@@ -735,13 +834,18 @@ class CANFDInterface:
         vendor library never observes stale bytes from a previous frame's
         DLC padding.
         """
-        target.ID = message.arbitration_id
-        target.TimeStamp = 0
-        target.FrameType = (
+        frame_type = (
             message.frame_type
             if message.frame_type is not None
             else self._config.frame_type
         )
+        if frame_type & 0x08 and not frame_type & 0x04:
+            raise ValidationError("FrameType BRS bit requires the CAN FD bit")
+        if not frame_type & 0x04 and message.dlc is not None and message.dlc > 8:
+            raise ValidationError("classic CAN frames cannot use a DLC greater than 8")
+        target.ID = message.arbitration_id
+        target.TimeStamp = 0
+        target.FrameType = frame_type
         target.DLC = message.dlc or 0
         target.ExternFlag = (
             CANFD_EXTENDED_FRAME_FLAG
@@ -781,7 +885,11 @@ class CANFDInterface:
             self._tx_frame = saved
         return frame
 
-    def _frame_to_message(self, frame: CanFDMsg) -> CANFDMessage:
+    def _frame_to_message(self, frame: CanFDMsg) -> CANFDMessage | None:
+        if frame.FrameType & _FRAME_FAILED:
+            raise self._frame_receive_error(frame)
+        if frame.RemoteFlag or frame.FrameType & _FRAME_TRANSMITTED:
+            return None
         length = dlc_to_length(frame.DLC)
         # ctypes.string_at copies length bytes in a single C call; the previous
         # ``bytes(frame.Data[:length])`` materializes a Python list first which
@@ -797,6 +905,16 @@ class CANFDInterface:
             is_extended_id=bool(frame.ExternFlag),
             frame_type=frame.FrameType,
             timestamp=frame.TimeStamp,
+        )
+
+    def _frame_receive_error(self, frame: CanFDMsg) -> TransportError:
+        return TransportError(
+            "MiniCANFD receive diagnostic: "
+            f"device_index={self._device_index}, channel_index={self._channel_index}, "
+            f"ID=0x{frame.ID:x}, TimeStamp={frame.TimeStamp}, "
+            f"FrameType=0x{frame.FrameType:02x}, BusSatus=0x{frame.BusSatus:02x}, "
+            f"ErrSatus=0x{frame.ErrSatus:02x}, "
+            f"TECounter={frame.TECounter}, RECounter={frame.RECounter}"
         )
 
     def __enter__(self) -> "CANFDInterface":
@@ -835,6 +953,13 @@ def _load_library(library_path: str | Path | None) -> Any:
     errors: list[str] = []
     loader = _ctypes_loader()
     for candidate in _library_candidates(library_path):
+        # Resolve selected files before caching or loading. A relative basename
+        # passed to dlopen would search system directories instead of that file.
+        # Bare string candidates intentionally retain system-loader semantics.
+        if isinstance(candidate, Path):
+            candidate = Path(
+                os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+            )
         key = _canonical_library_key(candidate)
         with _library_load_lock:
             cached = _library_handle_cache.get(key)
@@ -845,7 +970,6 @@ def _load_library(library_path: str | Path | None) -> Any:
             try:
                 load_path = str(candidate)
                 if platform.system() == "Windows" and isinstance(candidate, Path):
-                    load_path = str(candidate.expanduser().resolve())
                     directory = str(Path(load_path).parent)
                     add_directory = getattr(os, "add_dll_directory", None)
                     if (
@@ -877,7 +1001,9 @@ def _load_library(library_path: str | Path | None) -> Any:
             "and keep dependency DLLs alongside it."
         )
     raise TransportError(
-        "Unable to load CANFD vendor library. The system loader is tried by default; "
+        "Unable to load CANFD vendor library. The system loader and installation "
+        "directories are tried by default; the SDK does not add the current "
+        "working directory. "
         "pass library_path=... or set "
         f"{_ENV_LIBRARY_PATH} to the libcanbus.so/HCanbus.dll path if the library is "
         f"not installed in a system search path.{platform_hint} Attempted:\n{attempted}"
@@ -915,7 +1041,6 @@ def _library_candidates(library_path: str | Path | None) -> list[str | Path]:
         candidates.append(Path("/usr/local/lib") / library_name)
     candidates.append(package_root / "vendor" / "libcanbus" / library_name)
     candidates.append(package_root / "hand" / library_name)
-    candidates.append(Path.cwd() / library_name)
     return candidates
 
 

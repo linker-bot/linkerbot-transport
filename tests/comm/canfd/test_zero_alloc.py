@@ -54,11 +54,11 @@ class _FakeLib:
 @pytest.fixture(autouse=True)
 def _reset_lifecycle_state():
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
     yield
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
 
 

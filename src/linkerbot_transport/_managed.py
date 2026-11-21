@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable, Iterator
+from contextlib import contextmanager
+from itertools import islice
 from typing import Generic, Protocol, TypeVar
 
-from .contracts import TransportHealth, TransportState
+from .contracts import _MAX_SEND_BATCH_FRAMES, TransportHealth, TransportState
 from .errors import (
     ClosedError,
     DeviceNotReadyError,
@@ -17,7 +19,7 @@ from .errors import (
     ValidationError,
     normalize_error,
 )
-from .receipts import SendReceipt
+from .receipts import BatchSendReceipt, SendReceipt
 from .routing import ReceiveRouter, RouteSubscription
 
 MessageT = TypeVar("MessageT")
@@ -88,6 +90,7 @@ class ManagedMessageTransport(Generic[MessageT]):
             monotonic=monotonic,
         )
         self._operation_lock = threading.RLock()
+        self._operation: str | None = None
         self._state_lock = threading.RLock()
         self._state = TransportState.CLOSED
         self._dispatcher: DispatcherLike[MessageT] | None = None
@@ -110,7 +113,7 @@ class ManagedMessageTransport(Generic[MessageT]):
     def open(self) -> None:
         """Create the dispatcher once and mark the connection open."""
 
-        with self._operation_lock:
+        with self._lifecycle_operation("open"):
             with self._state_lock:
                 if self._state is TransportState.OPEN:
                     return
@@ -168,6 +171,12 @@ class ManagedMessageTransport(Generic[MessageT]):
                             self._dispatcher = dispatcher
                             self._receive_callback = on_message
                         self._record_error(cleanup_error, faulted=True)
+                        if isinstance(error, Exception) and not isinstance(
+                            cleanup_error, Exception
+                        ):
+                            with self._state_lock:
+                                self._opening_error = None
+                            raise cleanup_error from error
                 classified = self._record_error(error, faulted=True)
                 with self._state_lock:
                     self._opening_error = None
@@ -178,7 +187,7 @@ class ManagedMessageTransport(Generic[MessageT]):
     def close(self) -> None:
         """Stop the owned dispatcher, retaining it when shutdown must retry."""
 
-        with self._operation_lock:
+        with self._lifecycle_operation("close"):
             with self._state_lock:
                 if self._state is TransportState.CLOSED:
                     return
@@ -191,7 +200,10 @@ class ManagedMessageTransport(Generic[MessageT]):
                     return
                 self._state = TransportState.CLOSING
                 self._active_token = None
-                self._receive_router.close()
+
+            # A receive notifier may be reading cached health while close
+            # waits for its terminal notification. Do not hold its state lock.
+            self._receive_router.close()
 
             try:
                 if receive_callback is not None:
@@ -219,6 +231,7 @@ class ManagedMessageTransport(Generic[MessageT]):
         """Close and replace the connection without replaying sent messages."""
 
         with self._operation_lock:
+            self._raise_if_lifecycle_busy()
             with self._state_lock:
                 had_connection = self._generation > 0
             self.close()
@@ -226,6 +239,25 @@ class ManagedMessageTransport(Generic[MessageT]):
             if had_connection:
                 with self._state_lock:
                     self._reconnect_count += 1
+
+    @contextmanager
+    def _lifecycle_operation(self, operation: str) -> Iterator[None]:
+        with self._operation_lock:
+            self._raise_if_lifecycle_busy()
+            try:
+                self._operation = operation
+                yield
+            finally:
+                self._operation = None
+
+    def _raise_if_lifecycle_busy(self) -> None:
+        # RLock serializes other threads but permits synchronous callbacks to
+        # reenter. Such callbacks must not replace resources the outer owner
+        # is still cleaning up. recover's own close/open remain sequential.
+        if self._operation is not None:
+            raise DeviceNotReadyError(
+                f"transport lifecycle operation already in progress: {self._operation}"
+            )
 
     def send(self, message: MessageT) -> SendReceipt:
         """Send through the dispatcher and return an observable result.
@@ -238,20 +270,152 @@ class ManagedMessageTransport(Generic[MessageT]):
         with self._state_lock:
             dispatcher = self._require_open_locked()
             generation = self._generation
+            token = self._active_token
         data_size = self._measure_data_size(message)
         receipt = SendReceipt(generation=generation, monotonic=self._monotonic)
         receipt._claim()
         try:
             dispatcher.send_now(message)
         except Exception as error:
-            classified = self._record_error(error, faulted=False)
+            with self._state_lock:
+                # The dispatcher may have already reported this terminal send
+                # failure, or its callback may have closed/recovered the owner.
+                # Do not count the fault twice or write an old error into a
+                # replacement generation; the receipt still keeps its cause.
+                if token is self._active_token and self._state is TransportState.OPEN:
+                    classified = self._record_error(error, faulted=False)
+                else:
+                    classified = normalize_error(error)
             receipt._fail(classified)
             return receipt
         with self._state_lock:
-            self._last_successful_tx_s = self._monotonic()
             self._tx_frames += 1
             self._tx_bytes += data_size
-            self._consecutive_errors = 0
+            if token is self._active_token and self._state is TransportState.OPEN:
+                self._last_successful_tx_s = self._monotonic()
+                self._consecutive_errors = 0
+        receipt._dispatch()
+        return receipt
+
+    def send_batch(
+        self,
+        messages: Iterable[MessageT],
+        *,
+        expected_generation: int | None = None,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> BatchSendReceipt:
+        """Synchronously send at most 32 frames on one connection generation.
+
+        Native-capable dispatchers send one block; other dispatchers send
+        individual frames on the same captured dispatcher. ``on_progress``
+        receives the cumulative confirmed prefix before receipt publication,
+        including progress before a process interrupt. It must be lightweight.
+        A failed native block adds no confirmed frames and is never replayed.
+        """
+
+        batch = tuple(islice(messages, _MAX_SEND_BATCH_FRAMES + 1))
+        if not 1 <= len(batch) <= _MAX_SEND_BATCH_FRAMES:
+            raise ValidationError(
+                f"a send batch must contain 1..{_MAX_SEND_BATCH_FRAMES} frames"
+            )
+        if expected_generation is not None and (
+            type(expected_generation) is not int or expected_generation < 0
+        ):
+            raise ValidationError("expected_generation must be a non-negative int")
+        if on_progress is not None and not callable(on_progress):
+            raise ValidationError("on_progress must be callable")
+        with self._state_lock:
+            dispatcher = self._require_open_locked()
+            generation = self._generation
+            token = self._active_token
+            if expected_generation is not None and expected_generation != generation:
+                raise DeviceNotReadyError(
+                    "batch belongs to another transport generation"
+                )
+        sizes = tuple(self._measure_data_size(message) for message in batch)
+        receipt = BatchSendReceipt(
+            frame_count=len(batch), generation=generation, monotonic=self._monotonic
+        )
+        receipt._claim()
+        confirmed = 0
+        accounted = 0
+
+        def account_confirmed() -> None:
+            nonlocal accounted
+            with self._state_lock:
+                frames = self._tx_frames + confirmed - accounted
+                data_bytes = self._tx_bytes + sum(sizes[accounted:confirmed])
+                try:
+                    self._tx_frames = frames
+                    self._tx_bytes = data_bytes
+                    accounted = confirmed
+                finally:
+                    # Retry absolute targets, not increments: an interrupt
+                    # between a counter and its marker must not double-count.
+                    self._tx_frames = frames
+                    self._tx_bytes = data_bytes
+                    accounted = confirmed
+
+        def commit(count: int) -> None:
+            nonlocal confirmed
+            if type(count) is not int or not confirmed < count <= len(batch):
+                raise ValidationError("dispatcher reported invalid batch progress")
+            confirmed = count
+            account_confirmed()
+            with self._state_lock:
+                if token is self._active_token and self._state is TransportState.OPEN:
+                    self._last_successful_tx_s = self._monotonic()
+                    self._consecutive_errors = 0
+            receipt._set_sent_frames(count)
+            if on_progress is not None:
+                on_progress(count)
+            if count < len(batch):
+                with self._state_lock:
+                    if token is not self._active_token:
+                        raise ClosedError("transport generation changed during batch")
+                    self._require_open_locked()
+
+        try:
+            # Size measurement is user-supplied and can close/recover the
+            # transport. Check the captured identity again before physical I/O.
+            with self._state_lock:
+                if token is not self._active_token:
+                    raise ClosedError("transport generation changed before batch")
+                self._require_open_locked()
+            send_batch_now = getattr(dispatcher, "send_batch_now", None)
+            if callable(send_batch_now):
+                send_batch_now(batch, on_progress=commit)
+            else:
+                for count, message in enumerate(batch, 1):
+                    dispatcher.send_now(message)
+                    commit(count)
+            if confirmed != len(batch):
+                raise ValidationError("dispatcher did not confirm the entire batch")
+        except BaseException as error:
+            # Preserve confirmed progress in the caller's receipt before an
+            # interrupt escapes; never turn it into an ordinary send failure.
+            account_confirmed()
+            receipt._set_sent_frames(confirmed)
+            if not isinstance(error, Exception):
+                if on_progress is not None and confirmed:
+                    try:
+                        on_progress(confirmed)
+                    except BaseException:
+                        # A cumulative progress retry cannot replace the
+                        # process interrupt already being propagated.
+                        pass
+                raise
+            with self._state_lock:
+                if (
+                    token is self._active_token
+                    and self._state is TransportState.OPEN
+                    and not isinstance(error, (ClosedError, DeviceNotReadyError))
+                ):
+                    classified = self._record_error(error, faulted=False)
+                else:
+                    classified = normalize_error(error)
+            receipt._fail(classified)
+            return receipt
         receipt._dispatch()
         return receipt
 
@@ -365,8 +529,9 @@ class ManagedMessageTransport(Generic[MessageT]):
         with self._state_lock:
             if token is not self._active_token:
                 return
+            generation = self._generation
             classified = self._record_error(error, faulted=True)
-        self._receive_router.abort(classified)
+        self._receive_router.abort(classified, generation=generation)
 
     def _record_error(self, error: BaseException, *, faulted: bool) -> LinkerbotError:
         classified = normalize_error(error)
