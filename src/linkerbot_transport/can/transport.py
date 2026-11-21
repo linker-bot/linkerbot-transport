@@ -11,7 +11,7 @@ import can
 from linkerbot_transport._managed import DispatcherFactory, ManagedMessageTransport
 from linkerbot_transport._python_can import (
     BusOption,
-    freeze_bus_options,
+    normalize_channel_options,
     positive_int,
     validate_channel,
 )
@@ -61,7 +61,9 @@ class CANTransport(ManagedMessageTransport[can.Message]):
         positive_int(bitrate, "bitrate")
         if not isinstance(receive_own_messages, bool):
             raise ValidationError("receive_own_messages must be bool")
-        options = freeze_bus_options(bus_options)
+        interface_name, options = normalize_channel_options(
+            interface_name, interface_type, bus_options
+        )
         if (
             not isinstance(max_consecutive_errors, int)
             or isinstance(max_consecutive_errors, bool)

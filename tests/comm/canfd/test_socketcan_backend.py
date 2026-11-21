@@ -19,10 +19,69 @@ from linkerbot_transport.canfd import (
     CANFDBackend,
     CANFDMessage,
 )
+from linkerbot_transport.canfd import socketcan_backend as socketcan
 from linkerbot_transport.canfd.socketcan_backend import SocketCANFDBackend
 from linkerbot_transport.errors import TransportError, ValidationError
 
 pytestmark = [pytest.mark.canfd]
+
+
+@pytest.mark.parametrize(
+    "initial_fd,requested_fd",
+    [(True, False), (False, True), (True, True), (False, False)],
+)
+def test_reconfigure_sets_final_fd_state_explicitly(
+    monkeypatch, fake_can_bus, initial_fd, requested_fd
+):
+    state = socketcan._LinkState(
+        kind="can", up=True, fd=initial_fd, bitrate=1_000_000, data_bitrate=5_000_000
+    )
+    commands = []
+
+    def run_ip(args):
+        commands.append(args)
+        if "down" in args:
+            state.up = False
+        if "up" in args:
+            state.up = True
+        # Preserve fields omitted by a command, as the kernel does.
+        if "fd" in args:
+            state.fd = args[args.index("fd") + 1] == "on"
+
+    monkeypatch.setattr(socketcan, "_read_link_state", lambda _: state)
+    monkeypatch.setattr(socketcan, "_run_ip", run_ip)
+    backend = SocketCANFDBackend("audit-only", fd=requested_fd, auto_reconfigure=True)
+    try:
+        assert backend.fd is requested_fd
+        assert state.fd is requested_fd
+        assert state.up
+        if initial_fd == requested_fd:
+            assert not commands
+        else:
+            assert len(commands) == 2
+            assert commands[-1][-2:] == ["fd", "on" if requested_fd else "off"]
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("fd", [True, False])
+def test_manual_commands_include_both_fd_directions(fd):
+    for command in (
+        socketcan._format_setup_command("can0", 1_000_000, 5_000_000, fd),
+        socketcan._format_reconfigure_command("can0", 1_000_000, 5_000_000, fd),
+    ):
+        assert command.endswith("fd " + ("on" if fd else "off"))
+
+
+def test_default_classic_mode_mismatch_gives_fd_off_without_reconfiguring(
+    fake_can_bus, with_ip_present, link_show
+):
+    link_show.show_response = _link_show_proc(
+        returncode=0, stdout=_link_show_payload(fd=True)
+    )
+    with pytest.raises(TransportError, match="fd off"):
+        SocketCANFDBackend("audit-only", fd=False)
+    assert all(args[:3] == ["ip", "-d", "-j"] for args in link_show.runs)
 
 
 def _link_show_proc(
@@ -47,11 +106,12 @@ def _link_show_payload(
             {
                 "flags": ["UP", "LOWER_UP"] if up else [],
                 "linkinfo": {
+                    "info_kind": "can",
                     "info_data": {
                         "ctrlmode": ["FD"] if fd else [],
                         "bittiming": {"bitrate": bitrate},
                         "data_bittiming": {"bitrate": data_bitrate},
-                    }
+                    },
                 },
             }
         ]
@@ -525,3 +585,23 @@ def test_missing_ip_command_raises(fake_can_bus) -> None:
     ):
         with pytest.raises(TransportError, match="iproute2"):
             SocketCANFDBackend(channel="can0")
+
+
+@pytest.mark.parametrize("kind", ["ether", "bridge", "vcan", None])
+@pytest.mark.parametrize("auto_reconfigure", [False, True])
+def test_rejects_non_can_link_before_any_mutation(
+    fake_can_bus, with_ip_present, link_show, kind, auto_reconfigure
+):
+    payload = json.loads(_link_show_payload(bitrate=500_000))
+    if kind is not None:
+        payload[0]["linkinfo"]["info_kind"] = kind
+    else:
+        payload[0]["linkinfo"].pop("info_kind")
+    link_show.show_response = _link_show_proc(stdout=json.dumps(payload))
+
+    with pytest.raises(TransportError, match="not a CAN interface"):
+        SocketCANFDBackend("audit-only", auto_reconfigure=auto_reconfigure)
+
+    assert len(link_show.runs) == 1
+    assert link_show.runs[0][:3] == ["ip", "-d", "-j"]
+    fake_can_bus.send.assert_not_called()

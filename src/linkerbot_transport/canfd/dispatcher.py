@@ -9,10 +9,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from linkerbot_transport._worker import WorkerThread
+from linkerbot_transport.contracts import _MAX_SEND_BATCH_FRAMES
 from linkerbot_transport.errors import (
     ClosedError,
+    ErrorCode,
     LinkerbotError,
     QueueFullError,
+    TimeoutError,
     TransportError,
     ValidationError,
 )
@@ -81,6 +85,8 @@ class CANFDMessageDispatcher:
         on_bus_error: Callable[[Exception], None] | None = None,
         max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
         interface: CANFDBackend | None = None,
+        *,
+        start_send_worker: bool = True,
     ) -> None:
         """Initialize dispatcher threads for one CANFD interface.
 
@@ -89,6 +95,9 @@ class CANFDMessageDispatcher:
         When omitted, the dispatcher constructs a vendor ``CANFDInterface``
         using ``device_index`` / ``channel_index`` / ``library_path`` / ``config``,
         preserving the original behaviour.
+
+        ``start_send_worker=False`` leaves the queue worker unstarted until the
+        first queued ``send()``. Synchronous ``send_now()`` needs no TX worker.
         """
         if (
             not isinstance(max_consecutive_errors, int)
@@ -96,6 +105,8 @@ class CANFDMessageDispatcher:
             or max_consecutive_errors <= 0
         ):
             raise ValidationError("max_consecutive_errors must be a positive int")
+        if not isinstance(start_send_worker, bool):
+            raise ValidationError("start_send_worker must be bool")
 
         self._interface: CANFDBackend = (
             interface
@@ -132,24 +143,31 @@ class CANFDMessageDispatcher:
         self._close_lock = threading.Lock()
         self._interface_closed = False
         self._transmit_lock = threading.Lock()
+        self._consecutive_send_errors = 0
         self._immediate_dispatch = threading.local()
-        self._recv_thread = threading.Thread(
+        self._recv_thread = WorkerThread(
             target=self._recv_loop, daemon=True, name="CANFDMessageDispatcher.recv_loop"
         )
-        self._send_thread = threading.Thread(
+        self._send_thread = WorkerThread(
             target=self._send_loop, daemon=True, name="CANFDMessageDispatcher.send_loop"
         )
         try:
             self._recv_thread.start()
-            self._send_thread.start()
+            if start_send_worker:
+                self._send_thread.start()
         except BaseException as error:
             try:
                 CANFDMessageDispatcher.stop(self)
-            except BaseException:
+            except BaseException as cleanup_error:
                 self._logger.exception(
                     "CAN FD startup rollback failed; cleanup must retry"
                 )
                 setattr(error, "_failed_dispatcher", self)
+                if isinstance(error, Exception) and not isinstance(
+                    cleanup_error, Exception
+                ):
+                    setattr(cleanup_error, "_failed_dispatcher", self)
+                    raise cleanup_error from error
             raise
 
     @property
@@ -159,11 +177,19 @@ class CANFDMessageDispatcher:
 
     def _handle_bus_error(self, error: Exception) -> None:
         with self._error_lock:
-            if self._error_reported:
+            if not self._set_bus_error_locked(error):
                 return
-            self._error_reported = True
-            self._running = False
-            self._bus_error = error
+        self._notify_bus_error(error)
+
+    def _set_bus_error_locked(self, error: Exception) -> bool:
+        if self._error_reported:
+            return False
+        self._error_reported = True
+        self._running = False
+        self._bus_error = error
+        return True
+
+    def _notify_bus_error(self, error: Exception) -> None:
         self._receipts.fail_all(_send_error(error, "CANFD bus unavailable"))
         self._logger.error(f"CANFD bus fatal error, stopping dispatcher: {error}")
         if self._on_bus_error is not None:
@@ -286,23 +312,21 @@ class CANFDMessageDispatcher:
                         break
             try:
                 if send_batch is not None and len(batch) > 1:
-                    with self._transmit_lock:
-                        with self._error_lock:
-                            if not self._running:
-                                return
-                        send_batch([queued.message for queued in batch])
+                    self._transmit(
+                        lambda: send_batch([queued.message for queued in batch]),
+                        "CANFD background send failed",
+                        receipts=tuple(queued.receipt for queued in batch),
+                    )
                 else:
                     # Either backend lacks batch support, or only one frame
                     # was ready — both paths fall through to per-frame send.
-                    with self._transmit_lock:
-                        with self._error_lock:
-                            if not self._running:
-                                return
-                        for queued in batch:
-                            self._interface.send(queued.message)
+                    self._transmit(
+                        lambda: self._interface.send(first.message),
+                        "CANFD background send failed",
+                        receipts=tuple(queued.receipt for queued in batch),
+                    )
                 consecutive_errors = 0
-                for queued in batch:
-                    self._receipts.succeed(queued.receipt)
+                self._receipts.succeed_many(tuple(queued.receipt for queued in batch))
                 # Optional pacing; default 0 means rely entirely on the vendor
                 # USB stack. A previous version
                 # spun `while time.monotonic() < deadline: pass` here which
@@ -316,20 +340,8 @@ class CANFDMessageDispatcher:
                 if not self._is_running():
                     return
                 consecutive_errors += 1
-                if consecutive_errors >= self._max_consecutive_errors:
-                    self._logger.error(
-                        "CANFD send failed after %d consecutive errors: %s",
-                        consecutive_errors,
-                        error,
-                    )
-                    self._handle_bus_error(error)
-                    return
-                self._logger.warning(
-                    "CANFD send error (%d/%d): %s",
-                    consecutive_errors,
-                    self._max_consecutive_errors,
-                    error,
-                )
+                # This local count controls queue backoff only. The failure
+                # threshold is shared with synchronous sends in _transmit.
                 time.sleep(_error_backoff_s(consecutive_errors))
 
     def send(self, message: CANFDMessage) -> CANFDSendReceipt:
@@ -355,6 +367,8 @@ class CANFDMessageDispatcher:
                 state.mark_dispatched()
                 state.marked = True
             return _completed_receipt()
+        if self._send_thread.ident is None:
+            self._ensure_send_worker()
         receipt = CANFDSendReceipt()
         with self._error_lock:
             self._raise_if_cannot_send_locked()
@@ -371,19 +385,110 @@ class CANFDMessageDispatcher:
                 raise
         return receipt
 
-    def send_now(self, message: CANFDMessage) -> None:
-        """Synchronously send a frame for lifecycle-aware command scheduling."""
-        with self._transmit_lock:
+    def _ensure_send_worker(self) -> None:
+        failure: Exception | None = None
+        try:
             with self._error_lock:
                 self._raise_if_cannot_send_locked()
-            try:
-                self._interface.send(message)
-            except LinkerbotError:
-                raise
-            except Exception as error:
-                raise TransportError(
-                    f"CANFD send failed: {error}", cause=error
-                ) from error
+                if self._send_thread.ident is None:
+                    try:
+                        self._send_thread.start()
+                    except BaseException as error:
+                        # start() can be interrupted after spawning an OS thread
+                        # but before bootstrap assigns ident (Python 3.10/3.11).
+                        # Stop this dispatcher before allowing another caller in;
+                        # never retry start() on the same uncertain Thread.
+                        failure = _send_error(error, "CANFD send worker startup failed")
+                        self._set_bus_error_locked(failure)
+                        raise
+        except BaseException as error:
+            if failure is not None:
+                try:
+                    self._notify_bus_error(failure)
+                except BaseException as notification_error:
+                    if isinstance(error, Exception) and not isinstance(
+                        notification_error, Exception
+                    ):
+                        raise notification_error from error
+            raise
+
+    def send_now(self, message: CANFDMessage) -> None:
+        """Synchronously send a frame for lifecycle-aware command scheduling."""
+        self._transmit(lambda: self._interface.send(message), "CANFD send failed")
+
+    def send_batch_now(
+        self,
+        messages: tuple[CANFDMessage, ...],
+        *,
+        on_progress: Callable[[int], None],
+    ) -> None:
+        """Send one bounded block and publish its confirmed prefix outside locks.
+
+        Failed native blocks have unknown physical results and are never
+        retried. Backends without native batching retain per-frame progress.
+        """
+
+        if not 1 <= len(messages) <= _MAX_SEND_BATCH_FRAMES:
+            raise ValidationError(
+                f"a synchronous batch must contain 1..{_MAX_SEND_BATCH_FRAMES} frames"
+            )
+        if not callable(on_progress):
+            raise ValidationError("on_progress must be callable")
+        send_batch = getattr(self._interface, "send_batch", None)
+        if len(messages) > 1 and callable(send_batch):
+            self._transmit(
+                lambda: send_batch(list(messages)), "CANFD batch send failed"
+            )
+            on_progress(len(messages))
+        else:
+            for count, message in enumerate(messages, 1):
+                self.send_now(message)
+                on_progress(count)
+
+    def _transmit(
+        self,
+        send: Callable[[], None],
+        operation: str,
+        *,
+        receipts: tuple[CANFDSendReceipt, ...] = (),
+    ) -> None:
+        fatal_error = None
+        try:
+            with self._transmit_lock:
+                with self._error_lock:
+                    self._raise_if_cannot_send_locked()
+                    for receipt in receipts:
+                        if not receipt._claim():
+                            raise ClosedError(
+                                "queued send completed before transport claim"
+                            )
+                try:
+                    send()
+                except Exception as error:
+                    classified = _send_error(error, operation)
+                    if classified.code in (ErrorCode.TRANSPORT, ErrorCode.TIMEOUT):
+                        self._consecutive_send_errors += 1
+                        self._logger.warning(
+                            "CANFD send error (%d/%d): %s",
+                            self._consecutive_send_errors,
+                            self._max_consecutive_errors,
+                            classified,
+                        )
+                        if (
+                            self._consecutive_send_errors
+                            >= self._max_consecutive_errors
+                        ):
+                            with self._error_lock:
+                                if self._set_bus_error_locked(classified):
+                                    fatal_error = classified
+                    if classified is error:
+                        raise
+                    raise classified from error
+                else:
+                    self._consecutive_send_errors = 0
+        finally:
+            if fatal_error is not None:
+                self._notify_bus_error(fatal_error)
 
     @contextmanager
     def immediate_dispatch(
@@ -418,7 +523,8 @@ class CANFDMessageDispatcher:
         2. Give both workers a bounded opportunity to exit normally.
         3. Boundedly drain synchronous transmit activity. If it becomes idle,
            close while holding the transmit lock; otherwise close the interface
-           without that lock so backend shutdown can interrupt pending I/O.
+           without that lock. Backends may interrupt pending I/O; the native
+           backend instead times out safely if its I/O cannot drain.
         4. Perform a second bounded worker join and drain synchronous sends.
 
         If ``stop()`` is invoked from inside a dispatcher-managed callback,
@@ -448,6 +554,10 @@ class CANFDMessageDispatcher:
         close_error = self._close_interface_after_transmit_drain()
         running_threads = self._join_worker_threads(current)
         transmit_idle = self._wait_for_transmit_idle()
+        # Preserve classified backend failures (especially a close timeout)
+        # instead of hiding them behind the still-running worker symptom.
+        if close_error is not None:
+            raise close_error
         if running_threads:
             names = ", ".join(thread.name for thread in running_threads)
             raise RuntimeError(
@@ -455,8 +565,6 @@ class CANFDMessageDispatcher:
             )
         if not transmit_idle:
             raise RuntimeError("CANFD transmit did not stop after interface close")
-        if close_error is not None:
-            raise close_error
 
     def _is_running(self) -> bool:
         with self._error_lock:
@@ -471,15 +579,19 @@ class CANFDMessageDispatcher:
     def _join_worker_threads(self, current: threading.Thread) -> list[threading.Thread]:
         running_threads: list[threading.Thread] = []
         for thread in (self._send_thread, self._recv_thread):
-            if thread is current or not thread.is_alive():
+            if thread is current or thread.ident is None:
                 continue
-            thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
-            if thread.is_alive():
+            if not thread.exited.wait(timeout=THREAD_JOIN_TIMEOUT_S):
                 running_threads.append(thread)
         return running_threads
 
     def _close_interface(self) -> LinkerbotError | None:
-        with self._close_lock:
+        if not self._close_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S):
+            return TimeoutError(
+                "CANFD interface close timed out waiting for another close attempt; "
+                "cleanup ownership retained, retry stop()"
+            )
+        try:
             if self._interface_closed:
                 return None
             try:
@@ -492,13 +604,15 @@ class CANFDMessageDispatcher:
                 )
             self._interface_closed = True
             return None
+        finally:
+            self._close_lock.release()
 
     def _close_interface_after_transmit_drain(self) -> LinkerbotError | None:
         transmit_idle = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
         if not transmit_idle:
             self._logger.warning(
                 "CANFD transmit did not stop before interface close; "
-                "closing the interface to interrupt it"
+                "requesting backend shutdown"
             )
             return self._close_interface()
         try:
@@ -532,4 +646,6 @@ def _completed_receipt() -> CANFDSendReceipt:
 def _send_error(error: BaseException, operation: str) -> LinkerbotError:
     if isinstance(error, LinkerbotError):
         return error
+    if isinstance(error, (ValueError, TypeError)):
+        return ValidationError(f"{operation}: {error}", cause=error)
     return TransportError(f"{operation}: {error}", cause=error)

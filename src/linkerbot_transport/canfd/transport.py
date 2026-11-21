@@ -106,6 +106,7 @@ class CANFDTransport(ManagedMessageTransport[CANFDMessage]):
                         config=normalized_config,
                         on_bus_error=on_bus_error,
                         max_consecutive_errors=max_consecutive_errors,
+                        start_send_worker=False,
                     )
                 except BaseException as error:
                     failed_interface = getattr(error, "_failed_interface", None)
@@ -250,6 +251,7 @@ class PythonCANFDTransport(ManagedMessageTransport[CANFDMessage]):
                     interface=backend,
                     on_bus_error=on_bus_error,
                     max_consecutive_errors=max_consecutive_errors,
+                    start_send_worker=False,
                 )
 
             resolved_factory: DispatcherFactory[CANFDMessage] = create
@@ -325,6 +327,7 @@ class SocketCANFDTransport(ManagedMessageTransport[CANFDMessage]):
                     interface=backend,
                     on_bus_error=on_bus_error,
                     max_consecutive_errors=max_consecutive_errors,
+                    start_send_worker=False,
                 )
 
             resolved_factory: DispatcherFactory[CANFDMessage] = create

@@ -1,9 +1,11 @@
+import builtins
 import logging
 import queue
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,16 +14,19 @@ import can
 from linkerbot_transport._python_can import (
     BusOption,
     ChannelClaim,
-    freeze_bus_options,
+    normalize_channel_options,
     open_bus,
     positive_int,
     rollback_bus_open,
     validate_channel,
 )
+from linkerbot_transport._worker import WorkerThread
 from linkerbot_transport.errors import (
     ClosedError,
+    ErrorCode,
     LinkerbotError,
     QueueFullError,
+    TimeoutError,
     TransportError,
     ValidationError,
 )
@@ -102,7 +107,9 @@ class CANMessageDispatcher:
         positive_int(bitrate, "bitrate")
         if not isinstance(receive_own_messages, bool):
             raise ValidationError("receive_own_messages must be bool")
-        options = freeze_bus_options(bus_options)
+        interface_name, options = normalize_channel_options(
+            interface_name, interface_type, bus_options
+        )
         self._can_interface = CanInterface(
             interface_name=interface_name, interface_type=interface_type
         )
@@ -123,11 +130,12 @@ class CANMessageDispatcher:
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._transmit_lock = threading.Lock()
+        self._consecutive_send_errors = 0
         self._immediate_dispatch = threading.local()
-        self._recv_thread: threading.Thread = threading.Thread(
+        self._recv_thread = WorkerThread(
             target=self._recv_loop, daemon=True, name="CANMessageDispatcher.recv_loop"
         )
-        self._send_thread: threading.Thread = threading.Thread(
+        self._send_thread = WorkerThread(
             target=self._send_loop, daemon=True, name="CANMessageDispatcher.send_loop"
         )
         # Set up all cleanup state before acquiring the physical resource.
@@ -157,13 +165,18 @@ class CANMessageDispatcher:
             try:
                 # Do not dispatch to a subclass's partially initialized stop().
                 CANMessageDispatcher.stop(self)
-            except BaseException:
+            except BaseException as cleanup_error:
                 self._logger.exception(
                     "CAN startup rollback failed; cleanup must retry"
                 )
                 # ManagedMessageTransport can retain this otherwise unreturned
                 # object. Preserve the original exception, including Ctrl+C.
                 setattr(error, "_failed_dispatcher", self)
+                if isinstance(error, Exception) and not isinstance(
+                    cleanup_error, Exception
+                ):
+                    setattr(cleanup_error, "_failed_dispatcher", self)
+                    raise cleanup_error from error
             raise
 
     @property
@@ -174,11 +187,19 @@ class CANMessageDispatcher:
     def _handle_bus_error(self, error: Exception) -> None:
         """Handle a fatal bus error by stopping the dispatcher and notifying."""
         with self._error_lock:
-            if self._error_reported:
+            if not self._set_bus_error_locked(error):
                 return
-            self._error_reported = True
-            self._running = False
-            self._bus_error = error
+        self._notify_bus_error(error)
+
+    def _set_bus_error_locked(self, error: Exception) -> bool:
+        if self._error_reported:
+            return False
+        self._error_reported = True
+        self._running = False
+        self._bus_error = error
+        return True
+
+    def _notify_bus_error(self, error: Exception) -> None:
         self._receipts.fail_all(_send_error(error, "CAN bus unavailable"))
         self._logger.error("CAN bus fatal error, stopping dispatcher: %s", error)
         if self._on_bus_error is not None:
@@ -198,8 +219,23 @@ class CANMessageDispatcher:
         while self._is_running():
             try:
                 msg = self._bus.recv(timeout=0.01)
+                if msg is not None and msg.is_error_frame:
+                    raise TransportError(
+                        "CAN receive error frame: "
+                        f"ID=0x{msg.arbitration_id:x}, "
+                        f"is_extended_id={msg.is_extended_id}, "
+                        f"is_error_frame={msg.is_error_frame}, "
+                        f"timestamp={msg.timestamp}, data={bytes(msg.data).hex()}"
+                    )
+                if msg is not None:
+                    try:
+                        _validate_classic_message(msg)
+                    except ValidationError as error:
+                        raise TransportError(
+                            f"invalid classic CAN receive frame: {error}", cause=error
+                        ) from error
                 consecutive_errors = 0
-                if not msg:
+                if msg is None or msg.is_remote_frame:
                     continue
                 if not self._is_running():
                     return
@@ -254,7 +290,6 @@ class CANMessageDispatcher:
         Dequeues messages from the send queue and transmits them at a fixed
         interval of 300 us to avoid flooding the CAN bus.
         """
-        consecutive_errors = 0
         while self._is_running():
             try:
                 queued = self._send_queue.get(timeout=0.01)
@@ -262,12 +297,11 @@ class CANMessageDispatcher:
                 continue
             try:
                 deadline = time.monotonic() + self.SEND_INTERVAL_S
-                with self._transmit_lock:
-                    with self._error_lock:
-                        if not self._running:
-                            return
-                    self._bus.send(queued.message, timeout=self.SEND_TIMEOUT_S)
-                consecutive_errors = 0
+                self._transmit(
+                    lambda: self._bus.send(queued.message, timeout=self.SEND_TIMEOUT_S),
+                    "CAN background send failed",
+                    receipts=(queued.receipt,),
+                )
                 self._receipts.succeed(queued.receipt)
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
@@ -276,16 +310,6 @@ class CANMessageDispatcher:
                 send_error = _send_error(error, "CAN background send failed")
                 self._receipts.fail(queued.receipt, send_error)
                 if not self._is_running():
-                    return
-                consecutive_errors += 1
-                self._logger.warning(
-                    "CAN send error (%d/%d): %s",
-                    consecutive_errors,
-                    self._max_consecutive_errors,
-                    error,
-                )
-                if consecutive_errors >= self._max_consecutive_errors:
-                    self._handle_bus_error(error)
                     return
 
     def send(self, msg: can.Message) -> SendReceipt:
@@ -314,13 +338,15 @@ class CANMessageDispatcher:
                 state.mark_dispatched()
                 state.marked = True
             return SendReceipt.completed()
+        _validate_classic_message(msg)
+        # python-can messages and their data are mutable. The queue owns a
+        # snapshot; later caller mutations must not change an accepted frame.
+        msg = deepcopy(msg)
+        if self._send_thread.ident is None:
+            self._ensure_send_worker()
         receipt = SendReceipt()
         with self._error_lock:
             self._raise_if_cannot_send_locked()
-            # High-level transports use send_now exclusively. Start the legacy
-            # queue worker only if a caller actually chooses asynchronous send.
-            if self._send_thread.ident is None:
-                self._send_thread.start()
             self._receipts.register(receipt)
             try:
                 self._send_queue.put_nowait(_QueuedSend(msg, receipt))
@@ -332,6 +358,32 @@ class CANMessageDispatcher:
                 raise
         return receipt
 
+    def _ensure_send_worker(self) -> None:
+        failure: Exception | None = None
+        try:
+            with self._error_lock:
+                self._raise_if_cannot_send_locked()
+                if self._send_thread.ident is None:
+                    try:
+                        self._send_thread.start()
+                    except BaseException as error:
+                        # A process interrupt can arrive after OS thread creation
+                        # but before ident is set. Require a fresh dispatcher,
+                        # rather than starting the same uncertain Thread twice.
+                        failure = _send_error(error, "CAN send worker startup failed")
+                        self._set_bus_error_locked(failure)
+                        raise
+        except BaseException as error:
+            if failure is not None:
+                try:
+                    self._notify_bus_error(failure)
+                except BaseException as notification_error:
+                    if isinstance(error, Exception) and not isinstance(
+                        notification_error, Exception
+                    ):
+                        raise notification_error from error
+            raise
+
     def send_now(self, msg: can.Message) -> None:
         """Send one frame synchronously and return only after backend success.
 
@@ -339,17 +391,57 @@ class CANMessageDispatcher:
         an actual transport call rather than insertion into the asynchronous
         worker queue.
         """
-        with self._transmit_lock:
-            with self._error_lock:
-                self._raise_if_cannot_send_locked()
-            try:
-                self._bus.send(msg, timeout=self.SEND_TIMEOUT_S)
-            except LinkerbotError:
-                raise
-            except Exception as error:
-                raise TransportError(
-                    f"CAN send failed: {error}", cause=error
-                ) from error
+        _validate_classic_message(msg)
+        self._transmit(
+            lambda: self._bus.send(msg, timeout=self.SEND_TIMEOUT_S), "CAN send failed"
+        )
+
+    def _transmit(
+        self,
+        send: Callable[[], None],
+        operation: str,
+        *,
+        receipts: tuple[SendReceipt, ...] = (),
+    ) -> None:
+        fatal_error = None
+        try:
+            with self._transmit_lock:
+                with self._error_lock:
+                    self._raise_if_cannot_send_locked()
+                    for receipt in receipts:
+                        if not receipt._claim():
+                            raise ClosedError(
+                                "queued send completed before transport claim"
+                            )
+                try:
+                    send()
+                except Exception as error:
+                    classified = _send_error(error, operation)
+                    if classified.code in (ErrorCode.TRANSPORT, ErrorCode.TIMEOUT):
+                        self._consecutive_send_errors += 1
+                        self._logger.warning(
+                            "CAN send error (%d/%d): %s",
+                            self._consecutive_send_errors,
+                            self._max_consecutive_errors,
+                            classified,
+                        )
+                        if (
+                            self._consecutive_send_errors
+                            >= self._max_consecutive_errors
+                        ):
+                            with self._error_lock:
+                                if self._set_bus_error_locked(classified):
+                                    fatal_error = classified
+                    if classified is error:
+                        raise
+                    raise classified from error
+                else:
+                    self._consecutive_send_errors = 0
+        finally:
+            # Latch failure before another sender can enter, then notify only
+            # after releasing the transmit lock: callbacks may stop/recover.
+            if fatal_error is not None:
+                self._notify_bus_error(fatal_error)
 
     @contextmanager
     def immediate_dispatch(
@@ -407,6 +499,8 @@ class CANMessageDispatcher:
 
         running_threads = self._join_worker_threads(current)
         transmit_idle = self._wait_for_transmit_idle()
+        if shutdown_error is not None:
+            raise shutdown_error
         if running_threads:
             names = ", ".join(thread.name for thread in running_threads)
             raise RuntimeError(
@@ -414,8 +508,6 @@ class CANMessageDispatcher:
             )
         if not transmit_idle:
             raise RuntimeError("CAN transmit did not stop after bus shutdown")
-        if shutdown_error is not None:
-            raise shutdown_error
 
     def _is_running(self) -> bool:
         with self._error_lock:
@@ -428,8 +520,14 @@ class CANMessageDispatcher:
             raise RuntimeError("Cannot send on a stopped CANMessageDispatcher")
 
     def _shutdown_bus(self) -> LinkerbotError | None:
-        with self._shutdown_lock:
+        if not self._shutdown_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S):
+            return TimeoutError(
+                "CAN bus shutdown timed out waiting for another shutdown attempt; "
+                "cleanup ownership retained, retry stop()"
+            )
+        try:
             if self._shutdown_complete:
+                self._channel_claim.release()
                 return None
             try:
                 self._bus.shutdown()
@@ -440,6 +538,8 @@ class CANMessageDispatcher:
             self._shutdown_complete = True
             self._channel_claim.release()
             return None
+        finally:
+            self._shutdown_lock.release()
 
     def _shutdown_bus_after_transmit_drain(self) -> LinkerbotError | None:
         transmit_idle = self._transmit_lock.acquire(timeout=THREAD_JOIN_TIMEOUT_S)
@@ -463,10 +563,9 @@ class CANMessageDispatcher:
     def _join_worker_threads(self, current: threading.Thread) -> list[threading.Thread]:
         running_threads: list[threading.Thread] = []
         for thread in (self._recv_thread, self._send_thread):
-            if thread is current or not thread.is_alive():
+            if thread is current or thread.ident is None:
                 continue
-            thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
-            if thread.is_alive():
+            if not thread.exited.wait(timeout=THREAD_JOIN_TIMEOUT_S):
                 running_threads.append(thread)
         return running_threads
 
@@ -493,7 +592,24 @@ def _error_backoff_s(consecutive_errors: int) -> float:
     return min(ERROR_BACKOFF_BASE_S * consecutive_errors, ERROR_BACKOFF_MAX_S)
 
 
+def _validate_classic_message(message: can.Message) -> None:
+    if not isinstance(message, can.Message):
+        raise ValidationError("classic CAN message must be can.Message")
+    try:
+        message._check()
+        if message.is_fd:
+            raise ValueError("CAN FD frame is not supported on a classic CAN channel")
+    except (ValueError, TypeError) as error:
+        raise ValidationError(
+            f"invalid classic CAN frame: {error}", cause=error
+        ) from error
+
+
 def _send_error(error: BaseException, operation: str) -> LinkerbotError:
     if isinstance(error, LinkerbotError):
         return error
+    if isinstance(error, (ValueError, TypeError)):
+        return ValidationError(f"{operation}: {error}", cause=error)
+    if isinstance(error, (can.CanTimeoutError, builtins.TimeoutError)):
+        return TimeoutError(f"{operation}: {error}", cause=error)
     return TransportError(f"{operation}: {error}", cause=error)

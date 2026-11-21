@@ -13,6 +13,7 @@ from linkerbot_transport.canfd.dispatcher import CANFDMessageDispatcher
 from linkerbot_transport.errors import (
     ClosedError,
     QueueFullError,
+    TimeoutError,
     TransportError,
     ValidationError,
 )
@@ -738,3 +739,57 @@ def test_interface_close_failure_is_preserved_and_retryable() -> None:
     dispatcher.stop()
     assert dispatcher._interface_closed is True
     assert interface.close_calls == 2
+
+
+def test_concurrent_stop_waiter_times_out_while_backend_close_is_running(
+    monkeypatch,
+):
+    monkeypatch.setattr(dispatcher_module, "THREAD_JOIN_TIMEOUT_S", 0.02)
+    entered = threading.Event()
+    release = threading.Event()
+    owner_errors = []
+    waiter_errors = []
+    waiter_done = threading.Event()
+
+    class BlockingCloseInterface(FakeInterface):
+        def close(self):
+            entered.set()
+            assert release.wait(timeout=5)
+            super().close()
+
+    interface = BlockingCloseInterface()
+    dispatcher = CANFDMessageDispatcher(interface=interface)
+
+    def stop(errors, done=None):
+        try:
+            dispatcher.stop()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            if done is not None:
+                done.set()
+
+    owner = threading.Thread(target=stop, args=(owner_errors,), daemon=True)
+    waiter = threading.Thread(
+        target=stop, args=(waiter_errors, waiter_done), daemon=True
+    )
+    owner.start()
+    try:
+        assert entered.wait(timeout=1)
+        waiter.start()
+        assert waiter_done.wait(timeout=0.5)
+        assert len(waiter_errors) == 1
+        assert isinstance(waiter_errors[0], TimeoutError)
+        assert not dispatcher._interface_closed
+        assert interface.close_calls == 0
+    finally:
+        release.set()
+        owner.join(timeout=1)
+        if waiter.ident is not None:
+            waiter.join(timeout=1)
+        dispatcher.stop()
+    assert owner_errors == []
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert interface.close_calls == 1
+    assert dispatcher._interface_closed

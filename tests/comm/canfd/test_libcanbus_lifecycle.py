@@ -66,11 +66,11 @@ class _FakeLib:
 def _reset_lifecycle_state():
     """Wipe the module-level refcount table between tests for isolation."""
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
     yield
     with backend._lifecycle_lock:
-        backend._lifecycle_refcount.clear()
+        backend._lifecycle_references.clear()
         backend._lifecycle_lib.clear()
 
 

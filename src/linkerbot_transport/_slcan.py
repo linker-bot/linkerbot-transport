@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 import can
+import serial
 from can.interfaces.slcan import slcanBus
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,9 +16,14 @@ _LOGGER = logging.getLogger(__name__)
 class ManagedSlcanBus(slcanBus):
     """Always release the local serial handle, even when the adapter is gone."""
 
+    # Extended FD header + 64 data bytes + optional four-digit timestamp + CR.
+    _MAX_LINE_BYTES = 143
+    _READ_BYTE_BUDGET = 4096
+
     def __init__(self, channel: str, **kwargs: Any) -> None:
         self._cleanup_lock = threading.Lock()
         self._serial_closed = False
+        self._discard_line = False
         try:
             super().__init__(channel=channel, **kwargs)
         except BaseException as error:
@@ -25,6 +31,52 @@ class ManagedSlcanBus(slcanBus):
             # release a serial port acquired before initialization failed.
             setattr(error, "_failed_bus", self)
             raise
+
+    def _read(self, timeout: float | None) -> str | None:
+        """Bound partial lines and resynchronize after an overlong/bad line."""
+        deadline = serial.Timeout(timeout)
+        consumed = 0
+        try:
+            while consumed < self._READ_BYTE_BUDGET:
+                waiting = self.serialPortOrig.in_waiting
+                count = min(max(1, waiting), self._READ_BYTE_BUDGET - consumed)
+                for _ in range(count):
+                    byte = self.serialPortOrig.read(1)
+                    if not byte:
+                        break
+                    consumed += 1
+                    delimiter = byte in (self._OK, self._ERROR)
+                    if self._discard_line:
+                        if delimiter:
+                            self._discard_line = False
+                            return None
+                    else:
+                        self._buffer.extend(byte)
+                        if len(self._buffer) > self._MAX_LINE_BYTES:
+                            self._buffer.clear()
+                            self._discard_line = not delimiter
+                            raise can.CanOperationError(
+                                "SLCAN line exceeds protocol limit"
+                            )
+                        if delimiter:
+                            # Consumed bytes must leave the buffer even when
+                            # decoding fails, so the next valid line can recover.
+                            raw = bytes(self._buffer)
+                            self._buffer.clear()
+                            return raw.decode("ascii")
+                    if timeout and deadline.expired():
+                        return None
+                if deadline.expired():
+                    return None
+            return None
+        except (OSError, UnicodeError) as error:
+            raise can.CanOperationError(
+                f"Could not read SLCAN line: {error}"
+            ) from error
+
+    def flush(self) -> None:
+        super().flush()
+        self._discard_line = False
 
     def shutdown(self) -> None:
         with self._cleanup_lock:

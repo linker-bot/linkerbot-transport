@@ -307,6 +307,55 @@ def test_old_generation_never_reaches_reopened_route() -> None:
     router.close()
 
 
+@pytest.mark.parametrize("generation", [None, 1, 2, 3])
+def test_abort_only_stops_the_selected_generation(generation) -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    router.close()
+    router.open(generation=2)
+    notifications: list[bool] = []
+    route = router.subscribe(5, on_available=lambda: notifications.append(True))
+    assert router.route(5, generation=2)
+    before = router.get_health()
+    failure = TransportError("connection failed")
+
+    router.abort(failure, generation=generation)
+
+    if generation is None or generation == 2:
+        assert not router.get_health().running
+        assert not route.get_health().active
+        assert router.get_health().queue_depth == 0
+        assert router.get_health().dropped_on_close == 1
+        assert notifications == [True, True]
+        with pytest.raises(TransportError) as raised:
+            route.receive(timeout_s=0)
+        assert raised.value is failure
+    else:
+        assert router.get_health() == before
+        assert route.get_health().active
+        assert notifications == [True]
+        assert route.receive(timeout_s=0).message == 5
+        assert router.subscribe(6).get_health().active
+    router.close()
+
+
+@pytest.mark.parametrize("generation", [True, -1, 1.5])
+def test_invalid_abort_generation_leaves_routes_untouched(generation) -> None:
+    router = ReceiveRouter[int, int](lambda message: message)
+    router.open(generation=1)
+    route = router.subscribe(5)
+    assert router.route(5, generation=1)
+    before = router.get_health()
+
+    with pytest.raises(ValidationError, match="generation"):
+        router.abort(TransportError("connection failed"), generation=generation)
+
+    assert router.get_health() == before
+    assert route.get_health().active
+    assert route.receive(timeout_s=0).message == 5
+    router.close()
+
+
 def test_concurrent_route_registration_and_close_is_consistent() -> None:
     router = ReceiveRouter[int, int](lambda message: message, max_routes=32)
     router.open(generation=1)

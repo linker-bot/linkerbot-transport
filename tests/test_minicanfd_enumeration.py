@@ -54,7 +54,7 @@ class Library:
 
 @pytest.fixture
 def library_factory(monkeypatch, tmp_path):
-    monkeypatch.setattr(backend, "_lifecycle_refcount", {})
+    monkeypatch.setattr(backend, "_lifecycle_references", {})
     monkeypatch.setattr(backend, "_lifecycle_lib", {})
     monkeypatch.setattr(backend, "_open_channel_counts", {})
     monkeypatch.setattr(backend, "_scanned_device_counts", {})
